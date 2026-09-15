@@ -383,11 +383,11 @@ impl ServerEventSender for GfxFactory {
 impl GfxServerFactory for GfxFactory {
     fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
         // Only used if build_server_with_handle returned None, which it never does.
-        Box::new(Gfx { ctx: self.ctx.clone(), ev: self.ev.clone(), handle: Default::default(), stop: Default::default() })
+        Box::new(Gfx { ctx: self.ctx.clone(), ev: self.ev.clone(), handle: Default::default(), stop: Default::default(), avc_off: false })
     }
     fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
         let slot: Arc<Mutex<Option<GfxServerHandle>>> = Default::default();
-        let handler = Gfx { ctx: self.ctx.clone(), ev: self.ev.clone(), handle: slot.clone(), stop: Default::default() };
+        let handler = Gfx { ctx: self.ctx.clone(), ev: self.ev.clone(), handle: slot.clone(), stop: Default::default(), avc_off: false };
         let handle: GfxServerHandle = Arc::new(Mutex::new(GraphicsPipelineServer::new(Box::new(handler))));
         *slot.lock().unwrap() = Some(handle.clone());
         Some((GfxDvcBridge::new(handle.clone()), handle))
@@ -399,29 +399,51 @@ struct Gfx {
     ev: EvSender,
     handle: Arc<Mutex<Option<GfxServerHandle>>>,
     stop: Arc<AtomicBool>,
+    /// The client set AVC_DISABLED (iOS/macOS clients do). ironrdp intersects
+    /// flags with AND, which drops a negative flag unless we set it too; a
+    /// CapsConfirm that re-enables AVC makes those clients close the channel.
+    avc_off: bool,
 }
 
 impl GraphicsPipelineHandler for Gfx {
     fn capabilities_advertise(&mut self, pdu: &CapabilitiesAdvertisePdu) {
         info!(n = pdu.0.len(), caps = ?pdu.0, "client gfx caps");
+        self.avc_off = pdu.0.iter().filter_map(|raw| raw.parsed().ok().flatten()).any(|c| match c {
+            CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => flags.contains(CapabilitiesV10Flags::AVC_DISABLED),
+            CapabilitySet::V10_3 { flags } => flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
+            CapabilitySet::V10_4 { flags } | CapabilitySet::V10_5 { flags } | CapabilitySet::V10_6 { flags }
+            | CapabilitySet::V10_6Err { flags } => flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
+            CapabilitySet::V10_7 { flags } => flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+            _ => false,
+        });
+        if self.avc_off { info!("client has AVC disabled"); }
     }
     /// Full version ladder, highest first, so we confirm the client's newest
     /// version the way xrdp/FreeRDP do. The crate default only lists 10.7/10/8.1/8,
     /// which makes a Windows client without 10.7 land on plain V10.
     fn preferred_capabilities(&self) -> Vec<CapabilitySet> {
-        vec![
-            CapabilitySet::V10_7 { flags: CapabilitiesV107Flags::SMALL_CACHE },
-            CapabilitySet::V10_6Err { flags: CapabilitiesV104Flags::SMALL_CACHE },
-            CapabilitySet::V10_6 { flags: CapabilitiesV104Flags::SMALL_CACHE },
-            CapabilitySet::V10_5 { flags: CapabilitiesV104Flags::SMALL_CACHE },
-            CapabilitySet::V10_4 { flags: CapabilitiesV104Flags::SMALL_CACHE },
-            CapabilitySet::V10_3 { flags: CapabilitiesV103Flags::empty() },
-            CapabilitySet::V10_2 { flags: CapabilitiesV10Flags::SMALL_CACHE },
+        let off = self.avc_off;
+        let v10 = |f: CapabilitiesV10Flags| if off { f | CapabilitiesV10Flags::AVC_DISABLED } else { f };
+        let v103 = |f: CapabilitiesV103Flags| if off { f | CapabilitiesV103Flags::AVC_DISABLED } else { f };
+        let v104 = |f: CapabilitiesV104Flags| if off { f | CapabilitiesV104Flags::AVC_DISABLED } else { f };
+        let v107 = |f: CapabilitiesV107Flags| if off { f | CapabilitiesV107Flags::AVC_DISABLED } else { f };
+        let v81 = if off { CapabilitiesV81Flags::SMALL_CACHE } else { CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE };
+        // V10.1 has no flags field, so AVC cannot be disabled in it: skip it for such clients.
+        let mut caps = vec![
+            CapabilitySet::V10_7 { flags: v107(CapabilitiesV107Flags::SMALL_CACHE) },
+            CapabilitySet::V10_6Err { flags: v104(CapabilitiesV104Flags::SMALL_CACHE) },
+            CapabilitySet::V10_6 { flags: v104(CapabilitiesV104Flags::SMALL_CACHE) },
+            CapabilitySet::V10_5 { flags: v104(CapabilitiesV104Flags::SMALL_CACHE) },
+            CapabilitySet::V10_4 { flags: v104(CapabilitiesV104Flags::SMALL_CACHE) },
+            CapabilitySet::V10_3 { flags: v103(CapabilitiesV103Flags::empty()) },
+            CapabilitySet::V10_2 { flags: v10(CapabilitiesV10Flags::SMALL_CACHE) },
             CapabilitySet::V10_1,
-            CapabilitySet::V10 { flags: CapabilitiesV10Flags::SMALL_CACHE },
-            CapabilitySet::V8_1 { flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE },
+            CapabilitySet::V10 { flags: v10(CapabilitiesV10Flags::SMALL_CACHE) },
+            CapabilitySet::V8_1 { flags: v81 },
             CapabilitySet::V8 { flags: CapabilitiesV8Flags::SMALL_CACHE },
-        ]
+        ];
+        if off { caps.retain(|c| !matches!(c, CapabilitySet::V10_1)); }
+        caps
     }
     fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32, total_frames_decoded: u32) {
         info!(frame_id, queue_depth, total_frames_decoded, "frame ack");
