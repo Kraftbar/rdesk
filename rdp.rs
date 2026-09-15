@@ -20,6 +20,7 @@ use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_svc::ChannelFlags;
 use core::num::{NonZeroU16, NonZeroUsize};
 use ironrdp_server::PixelFormat;
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
@@ -249,6 +250,11 @@ impl CredentialValidator for Login {
 
 struct Input {
     ctx: Arc<Ctx>,
+    /// keysym -> (keycode, needs Shift), built from the X keymap on first use.
+    keysyms: Option<HashMap<u32, (u8, bool)>>,
+    /// A keycode with no keysyms, temporarily bound to characters the layout
+    /// lacks (emoji etc.), the way xdotool types them.
+    spare: Option<(u8, u32)>,
 }
 
 impl Input {
@@ -267,6 +273,56 @@ impl Input {
             Some(kc) => self.fake(if pressed { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT }, kc, 0, 0),
             None => warn!(code, extended, "unmapped scancode"),
         }
+    }
+    /// Unicode keyboard events (on-screen keyboards, mstsc's Unicode input):
+    /// type the character through the server's own layout, Shift if needed;
+    /// characters the layout lacks are bound to a spare keycode on the fly.
+    fn unicode(&mut self, u: u16, pressed: bool) {
+        let ks = match u as u32 { c @ 0x20..=0xff => c, c => 0x0100_0000 | c };
+        if self.keysyms.is_none() { self.keysyms = Some(self.build_keysyms()); }
+        let kc = match self.keysyms.as_ref().unwrap().get(&ks) {
+            Some(&(kc, shift)) => {
+                if shift { self.fake(if pressed { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT }, 50, 0, 0); }
+                kc
+            }
+            None => match self.bind_spare(ks) {
+                Some(kc) => kc,
+                None => { warn!(u, "no keycode for unicode key"); return; }
+            },
+        };
+        self.fake(if pressed { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT }, kc, 0, 0);
+    }
+    fn build_keysyms(&mut self) -> HashMap<u32, (u8, bool)> {
+        let conn = &self.ctx.conn;
+        let (min, max) = (conn.setup().min_keycode, conn.setup().max_keycode);
+        let mut m = HashMap::new();
+        let Ok(r) = conn.get_keyboard_mapping(min, max - min + 1).and_then(|c| Ok(c.reply())) else { return m };
+        let Ok(r) = r else { return m };
+        let per = r.keysyms_per_keycode as usize;
+        // Column 0 = plain, 1 = Shift; prefer plain, remember the first free keycode.
+        for (col, shift) in [(0usize, false), (1, true)] {
+            for (i, kc) in (min..=max).enumerate() {
+                let ks = r.keysyms[i * per + col];
+                if ks != 0 { m.entry(ks).or_insert((kc, shift)); }
+            }
+        }
+        if self.spare.is_none() {
+            let free = (min..=max).enumerate().find(|(i, _)| r.keysyms[i * per..(i + 1) * per].iter().all(|&k| k == 0));
+            self.spare = free.map(|(_, kc)| (kc, 0));
+        }
+        m
+    }
+    fn bind_spare(&mut self, ks: u32) -> Option<u8> {
+        let (kc, bound) = self.spare?;
+        if bound != ks {
+            let conn = &self.ctx.conn;
+            conn.change_keyboard_mapping(1, kc, 2, &[ks, ks]).ok()?.check().ok()?;
+            let _ = conn.flush();
+            self.spare = Some((kc, ks));
+            // Give clients a moment to pick up the MappingNotify.
+            thread::sleep(Duration::from_millis(20));
+        }
+        Some(kc)
     }
 }
 
@@ -302,7 +358,8 @@ impl RdpServerInputHandler for Input {
         match e {
             KeyboardEvent::Pressed { code, extended } => self.key(code, extended, true),
             KeyboardEvent::Released { code, extended } => self.key(code, extended, false),
-            KeyboardEvent::UnicodePressed(u) | KeyboardEvent::UnicodeReleased(u) => warn!(u, "unicode key ignored"),
+            KeyboardEvent::UnicodePressed(u) => self.unicode(u, true),
+            KeyboardEvent::UnicodeReleased(u) => self.unicode(u, false),
             KeyboardEvent::Synchronize(_) => {}
         }
     }
@@ -760,7 +817,7 @@ async fn main() -> anyhow::Result<()> {
         builder.with_hybrid(acceptor, identity.pub_key.clone())
     };
     let mut server = builder
-        .with_input_handler(Input { ctx: ctx.clone() })
+        .with_input_handler(Input { ctx: ctx.clone(), keysyms: None, spare: None })
         .with_display_handler(Display { ctx: ctx.clone() })
         .with_gfx_factory(Some(Box::new(GfxFactory { ctx: ctx.clone(), ev })))
         .with_honor_client_desktop_size(true)

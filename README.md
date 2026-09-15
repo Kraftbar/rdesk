@@ -38,7 +38,7 @@ upright) instead gets a 1:1 window onto it (992x1850 phone → 992x1440 of the
 screen, opened around the pointer). Pushing the pointer into a 48 px border
 pans the window; pinch-zoom in the RD app then enlarges real pixels. A
 laptop, or a phone on its side, stays scaled. `--viewport` forces the window
-for every smaller client. `systemd/rdesk-rdp.service` runs it as a user unit.
+for every smaller client. `rdesk-rdp.service` is a systemd user unit for it (`cp` to `~/.config/systemd/user/`, `systemctl --user enable --now rdesk-rdp`).
 
 Input arrives as scancodes and is injected as X keycodes, so the server's
 keyboard layout applies (æøå fine). Frames: XShm grab -> ffmpeg h264_nvenc
