@@ -13,7 +13,7 @@ zlib tiles. Flat layout, ffmpeg does the codec work.
 
 ## rdesk-rdp (use this one)
 
-    ./target/release/rdesk-rdp [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--cpu] [--pass FIXED]
+    ./target/release/rdesk-rdp [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--cpu] [--pass FIXED] [--viewport]
 
 Two login modes:
 
@@ -32,6 +32,13 @@ The session is negotiated at the client's own desktop size and the screen is
 scaled into it, letterboxed (3440x1440 on a 1920x1080 laptop shows as
 1920x802 with black bars); mouse coordinates are mapped back. Same-size
 clients get the screen 1:1.
+
+A client that would have to shrink the screen below 45 % (a phone held
+upright) instead gets a 1:1 window onto it (992x1850 phone → 992x1440 of the
+screen, opened around the pointer). Pushing the pointer into a 48 px border
+pans the window; pinch-zoom in the RD app then enlarges real pixels. A
+laptop, or a phone on its side, stays scaled. `--viewport` forces the window
+for every smaller client. `systemd/rdesk-rdp.service` runs it as a user unit.
 
 Input arrives as scancodes and is injected as X keycodes, so the server's
 keyboard layout applies (æøå fine). Frames: XShm grab -> ffmpeg h264_nvenc

@@ -33,7 +33,7 @@ use x11cap::*;
 use x11rb::connection::Connection;
 use x11rb::protocol::shm::ConnectionExt as _;
 use x11rb::protocol::xfixes::ConnectionExt as _;
-use x11rb::protocol::xproto::{self, ImageFormat};
+use x11rb::protocol::xproto::{self, ConnectionExt as _, ImageFormat};
 use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
@@ -45,6 +45,9 @@ struct Opts {
     user: String,
     pass: String,
     certdir: PathBuf,
+    /// Force the 1:1 window for every client smaller than the screen; by
+    /// default only clients that would have to shrink it below 45 % get it.
+    viewport: bool,
 }
 
 fn parse_args() -> Opts {
@@ -52,6 +55,7 @@ fn parse_args() -> Opts {
     let mut o = Opts {
         bind: "0.0.0.0:3390".into(), fps: 30, bitrate: "12M".into(), cpu: false,
         user: String::new(), pass: String::new(), certdir: PathBuf::from(format!("{}/.config/rdesk", home)),
+        viewport: false,
     };
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
@@ -62,8 +66,10 @@ fn parse_args() -> Opts {
             "--cpu" => o.cpu = true,
             "--pass" => o.pass = a.next().expect("--pass PASSWORD"),
             "--certdir" => o.certdir = a.next().expect("--certdir DIR").into(),
+            "--viewport" => o.viewport = true,
             _ => {
-                eprintln!("usage: rdesk-rdp [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--cpu] [--certdir ~/.config/rdesk] [--pass STATIC]");
+                eprintln!("usage: rdesk-rdp [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--cpu] [--certdir ~/.config/rdesk] [--pass STATIC] [--viewport]");
+                eprintln!("--viewport: every smaller client gets the 1:1 window onto the screen (default: only when it would shrink below 45 %, i.e. phones)");
                 eprintln!("login: Linux user running the server + system password (mstsc must have the credentials saved),");
                 eprintln!("       or --pass PASSWORD for NLA with a fixed password (mstsc prompts each time)");
                 std::process::exit(2);
@@ -89,12 +95,29 @@ struct Ctx {
     mode: Mutex<Mode>,
     /// Desktop size negotiated with the current client (its own size, see `Fit`).
     out: Mutex<(u16, u16)>,
+    /// --viewport: force the window for every smaller client (default: below 45 % scale).
+    viewport: bool,
+    /// Top-left screen coordinate of that window.
+    view: Mutex<(u16, u16)>,
 }
 
 impl Ctx {
     fn fit(&self) -> Fit {
         let (ow, oh) = *self.out.lock().unwrap();
+        let scale = (ow as f64 / self.w as f64).min(oh as f64 / self.h as f64);
+        // A phone held upright would shrink the screen to ~0.3; a laptop or a
+        // phone on its side sits above 0.5 and reads fine scaled.
+        if scale < 1.0 && (self.viewport || scale < 0.45) {
+            let (vx, vy) = *self.view.lock().unwrap();
+            return Fit::window(self.w, self.h, ow, oh, vx, vy);
+        }
         Fit::new(self.w, self.h, ow, oh)
+    }
+    /// Move the viewport so that (vx, vy) is its top-left, clamped to the screen.
+    fn pan_to(&self, vx: i32, vy: i32) {
+        let f = self.fit();
+        let (mx, my) = (self.w.saturating_sub(f.fw) as i32, self.h.saturating_sub(f.fh) as i32);
+        *self.view.lock().unwrap() = (vx.clamp(0, mx) as u16, vy.clamp(0, my) as u16);
     }
 }
 
@@ -106,41 +129,60 @@ impl Ctx {
 struct Fit {
     /// Client desktop (= surface) size.
     ow: u16, oh: u16,
-    /// Scaled screen rectangle inside it, even-aligned for 4:2:0.
+    /// Screen rectangle inside it (scaled, or 1:1 in window mode), even-aligned for 4:2:0.
     fx: u16, fy: u16, fw: u16, fh: u16,
+    /// Window mode (--viewport): the client shows the fw x fh screen region at (vx, vy) 1:1.
+    win: Option<(u16, u16)>,
 }
 
 impl Fit {
     fn new(w: u16, h: u16, ow: u16, oh: u16) -> Fit {
         if (w, h) == (ow, oh) {
-            return Fit { ow, oh, fx: 0, fy: 0, fw: w, fh: h };
+            return Fit { ow, oh, fx: 0, fy: 0, fw: w, fh: h, win: None };
         }
         let s = (ow as f64 / w as f64).min(oh as f64 / h as f64);
         let fw = ((w as f64 * s) as u16).max(2) & !1;
         let fh = ((h as f64 * s) as u16).max(2) & !1;
-        Fit { ow, oh, fx: (ow - fw) / 2 & !1, fy: (oh - fh) / 2 & !1, fw, fh }
+        Fit { ow, oh, fx: (ow - fw) / 2 & !1, fy: (oh - fh) / 2 & !1, fw, fh, win: None }
+    }
+    /// A client-sized window onto the screen at (vx, vy); black where the client is larger.
+    fn window(w: u16, h: u16, ow: u16, oh: u16, vx: u16, vy: u16) -> Fit {
+        let (fw, fh) = (ow.min(w), oh.min(h));
+        Fit { ow, oh, fx: 0, fy: 0, fw, fh, win: Some((vx.min(w - fw), vy.min(h - fh))) }
     }
     fn identity(&self) -> bool {
-        self.fx == 0 && self.fy == 0 && (self.fw, self.fh) == (self.ow, self.oh)
+        self.win.is_none() && self.fx == 0 && self.fy == 0 && (self.fw, self.fh) == (self.ow, self.oh)
     }
     /// ffmpeg filter producing the client-sized picture, or None when nothing to do.
+    /// Window mode crops in `bitmap` instead, so the encoder sees client-sized frames.
     fn vf(&self) -> Option<String> {
-        if self.identity() { return None; }
+        if self.identity() || self.win.is_some() { return None; }
         Some(format!("scale={}:{}:flags=fast_bilinear,pad={}:{}:{}:{}", self.fw, self.fh, self.ow, self.oh, self.fx, self.fy))
     }
     /// Client desktop coordinates -> screen coordinates.
     fn to_screen(&self, x: u16, y: u16, w: u16, h: u16) -> (i16, i16) {
+        if let Some((vx, vy)) = self.win {
+            return ((vx + x.min(self.fw - 1)).min(w - 1) as i16, (vy + y.min(self.fh - 1)).min(h - 1) as i16);
+        }
         if self.identity() { return (x as i16, y as i16); }
         let sx = (x.saturating_sub(self.fx).min(self.fw - 1) as u32 * w as u32 / self.fw as u32) as i16;
         let sy = (y.saturating_sub(self.fy).min(self.fh - 1) as u32 * h as u32 / self.fh as u32) as i16;
         (sx, sy)
     }
-    /// Nearest-neighbour copy of a BGRX screen frame into a black client-sized frame (legacy path).
+    /// The client-sized BGRX frame for a screen frame: a copy, a 1:1 window, or
+    /// (legacy path only, the encoder scales otherwise) a nearest-neighbour fit.
     fn bitmap(&self, src: &[u8], w: u16, h: u16) -> Vec<u8> {
         if self.identity() { return src.to_vec(); }
         let (ow, fw, fh) = (self.ow as usize, self.fw as usize, self.fh as usize);
         let (w, h) = (w as usize, h as usize);
         let mut dst = vec![0u8; ow * self.oh as usize * 4];
+        if let Some((vx, vy)) = self.win {
+            for y in 0..fh {
+                let si = ((vy as usize + y) * w + vx as usize) * 4;
+                dst[y * ow * 4..y * ow * 4 + fw * 4].copy_from_slice(&src[si..si + fw * 4]);
+            }
+            return dst;
+        }
         for y in 0..fh {
             let srow = (y * h / fh) * w * 4;
             let drow = ((self.fy as usize + y) * ow + self.fx as usize) * 4;
@@ -268,6 +310,14 @@ impl RdpServerInputHandler for Input {
         use MouseEvent::*;
         match e {
             Move { x, y } => {
+                let f = self.ctx.fit();
+                if let Some((vx, vy)) = f.win {
+                    // Pushing the pointer into a 48 px border pans the window 32 px per event.
+                    const M: u16 = 48; const S: i32 = 32;
+                    let dx = if x < M { -S } else if x + M > f.fw { S } else { 0 };
+                    let dy = if y < M { -S } else if y + M > f.fh { S } else { 0 };
+                    if dx != 0 || dy != 0 { self.ctx.pan_to(vx as i32 + dx, vy as i32 + dy); }
+                }
                 let (sx, sy) = self.ctx.fit().to_screen(x, y, self.ctx.w, self.ctx.h);
                 self.fake(xproto::MOTION_NOTIFY_EVENT, 0, sx, sy)
             }
@@ -356,7 +406,16 @@ impl RdpServerDisplay for Display {
         let (w, h) = (client.width & !1, client.height & !1);
         *self.ctx.out.lock().unwrap() = (w, h);
         let fit = self.ctx.fit();
-        info!("client desktop {}x{}, screen {}x{} shown as {}x{} at {},{}", w, h, self.ctx.w, self.ctx.h, fit.fw, fit.fh, fit.fx, fit.fy);
+        if let Some(_) = fit.win {
+            // Start with the window centred on the pointer.
+            let p = self.ctx.conn.query_pointer(self.ctx.root).ok().and_then(|c| c.reply().ok());
+            let (px, py) = p.map(|p| (p.root_x as i32, p.root_y as i32)).unwrap_or((self.ctx.w as i32 / 2, self.ctx.h as i32 / 2));
+            self.ctx.pan_to(px - fit.fw as i32 / 2, py - fit.fh as i32 / 2);
+            let (vx, vy) = *self.ctx.view.lock().unwrap();
+            info!("client desktop {}x{}, screen {}x{} shown as a {}x{} window at {},{}", w, h, self.ctx.w, self.ctx.h, fit.fw, fit.fh, vx, vy);
+        } else {
+            info!("client desktop {}x{}, screen {}x{} shown as {}x{} at {},{}", w, h, self.ctx.w, self.ctx.h, fit.fw, fit.fh, fit.fx, fit.fy);
+        }
         DesktopSize { width: w, height: h }
     }
     async fn updates(&mut self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
@@ -538,7 +597,9 @@ fn stream(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<Atomic
         return Ok(());
     }
 
-    let mut enc = spawn_encoder(w, h, ctx.fps, &ctx.bitrate, ctx.nvenc, "avi", fit.vf().as_deref());
+    let win = fit.win.is_some();
+    let (ew, eh) = if win { (sw, sh) } else { (w, h) };
+    let mut enc = spawn_encoder(ew, eh, ctx.fps, &ctx.bitrate, ctx.nvenc, "avi", fit.vf().as_deref());
     let mut enc_in = enc.stdin.take().unwrap();
     let mut enc_out = enc.stdout.take().unwrap();
 
@@ -554,7 +615,9 @@ fn stream(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<Atomic
                 let busy = handle.lock().unwrap().should_backpressure();
                 if !busy {
                     if grab(&ctx).is_err() { break; }
-                    if enc_in.write_all(ctx.shm.buf()).is_err() { break; }
+                    // Window mode: crop per frame, the window moves while panning.
+                    let r = if win { enc_in.write_all(&ctx.fit().bitmap(ctx.shm.buf(), w, h)) } else { enc_in.write_all(ctx.shm.buf()) };
+                    if r.is_err() { break; }
                 }
                 let now = Instant::now();
                 if next > now { thread::sleep(next - now); } else { next = now; }
@@ -675,7 +738,8 @@ async fn main() -> anyhow::Result<()> {
     conn.xfixes_query_version(5, 0)?.reply().context("XFIXES missing")?;
     let shm = Arc::new(Shm::new(&conn, w as usize * h as usize * 4));
     let nvenc = !o.cpu && probe_nvenc();
-    let ctx = Arc::new(Ctx { conn, root, w, h, shm, fps: o.fps, bitrate: o.bitrate.clone(), nvenc, mode: Mutex::new(Mode::Unknown), out: Mutex::new((w, h)) });
+    let ctx = Arc::new(Ctx { conn, root, w, h, shm, fps: o.fps, bitrate: o.bitrate.clone(), nvenc, mode: Mutex::new(Mode::Unknown), out: Mutex::new((w, h)),
+                             viewport: o.viewport, view: Mutex::new((0, 0)) });
 
     let (cert, key) = ensure_cert(&o.certdir)?;
     let identity = TlsIdentityCtx::init_from_paths(&cert, &key).context("TLS identity")?;
@@ -706,8 +770,8 @@ async fn main() -> anyhow::Result<()> {
         server.set_credentials(Some(Credentials { username: o.user.clone(), password: o.pass.clone(), domain: None }));
     }
 
-    info!("rdesk-rdp: {}x{} @{}fps {} encoder={} login={} ({}) listening on {}",
-          w, h, o.fps, o.bitrate, if nvenc { "h264_nvenc" } else { "libx264" }, o.user,
+    info!("rdesk-rdp: {}x{}{} @{}fps {} encoder={} login={} ({}) listening on {}",
+          w, h, if o.viewport { " (window for every smaller client)" } else { "" }, o.fps, o.bitrate, if nvenc { "h264_nvenc" } else { "libx264" }, o.user,
           if o.pass.is_empty() { "TLS, system password from saved mstsc credentials" } else { "NLA, --pass" }, o.bind);
     // Own accept loop instead of server.run(): IronRDP serves one client at a
     // time, so a peer that vanishes mid-handshake (NAT dropping the flow) would
