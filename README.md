@@ -5,7 +5,7 @@ zlib tiles. Flat layout, ffmpeg does the codec work.
 
     rdp.rs      rdesk-rdp: native RDP server on IronRDP. Plain mstsc connects;
                 video is H.264 AVC420 over the GFX pipeline, legacy RemoteFX for
-                clients without H.264. NLA login with --user/--pass.
+                clients without H.264. Login as the Linux user (TLS) or NLA with --pass.
     server.rs   rdesk-server: the earlier custom protocol (Noise-encrypted TCP)
     client.rs   rdesk-client: custom client for rdesk-server (Linux/Windows)
     x11cap.rs   XShm grab, cursor overlay, ffmpeg spawn, shared by both servers
@@ -13,19 +13,46 @@ zlib tiles. Flat layout, ffmpeg does the codec work.
 
 ## rdesk-rdp (use this one)
 
-    ./target/release/rdesk-rdp [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--pass FIXED]
+    ./target/release/rdesk-rdp [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--cpu] [--pass FIXED]
 
-Log in from mstsc as the Linux user running the server, with that user's
-system password (checked through PAM's `unix_chkpwd`, so no password is
-stored anywhere). `--pass` replaces it with a fixed password if you want.
-TLS only, no NLA, same as xrdp: NLA/NTLM would need the password on the server.
+Two login modes:
+
+- default: TLS without NLA, like xrdp. Log in as the Linux user running the
+  server with that user's system password, checked through PAM's `unix_chkpwd`
+  (nothing stored). mstsc only sends a password it has *saved* to a non-NLA
+  server, so tick "Allow me to save credentials" or it will just reprompt.
+- `--pass FIXED`: NLA (CredSSP/NTLM) with a fixed password; mstsc prompts each
+  time. NTLM needs the password on the server, which is why the system
+  password can't be used here.
+
 First run writes a self-signed cert to `~/.config/rdesk/`; mstsc warns about it
 once. Needs `ffmpeg` and `openssl` on PATH, `DISPLAY` set.
+
+The session is negotiated at the client's own desktop size and the screen is
+scaled into it, letterboxed (3440x1440 on a 1920x1080 laptop shows as
+1920x802 with black bars); mouse coordinates are mapped back. Same-size
+clients get the screen 1:1.
 
 Input arrives as scancodes and is injected as X keycodes, so the server's
 keyboard layout applies (æøå fine). Frames: XShm grab -> ffmpeg h264_nvenc
 (AVI-framed so each frame is exact) -> AVC420 WireToSurface. Client frame
 acks throttle capture, so a slow link lowers fps instead of adding lag.
+Clients with GFX but no H.264 (FreeRDP built without it) fall back to
+IronRDP's bitmap updates.
+
+IronRDP serves one client at a time; the listener sets `TCP_USER_TIMEOUT`
+(20 s) so a peer that vanishes mid-handshake can't hold the door.
+
+Diagnostics: `RUST_LOG=info,ironrdp_acceptor=debug,ironrdp_server=debug` logs
+every PDU of the handshake; `RDESK_TRACE=1` logs each GFX flush;
+`RDESK_TEST=uncompressed` sends a raw test bitmap instead of H.264 to tell
+GFX plumbing problems from codec problems.
+
+Gotcha found the hard way: ironrdp-egfx 0.3 takes `Avc420Region` bounds as
+inclusive and derives the WireToSurface destRect as right+1/bottom+1. Pass
+`w-1`/`h-1`; with `w`/`h` the rect overshoots the surface by a pixel and mstsc
+silently resets the pipeline (re-advertises caps) on the first frame, then
+disconnects.
 
 ## rdesk-server / rdesk-client
 
