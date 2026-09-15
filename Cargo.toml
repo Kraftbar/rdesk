@@ -1,0 +1,22 @@
+[package]
+name = "rdesk"
+version = "0.1.0"
+edition = "2021"
+
+# Flat layout: every source file lives at the repo root.
+[[bin]]
+name = "rdesk-server"
+path = "server.rs"
+
+[[bin]]
+name = "rdesk-client"
+path = "client.rs"
+
+[dependencies]
+x11rb = { version = "0.14", features = ["shm", "xtest", "xfixes"] }
+libc = "0.2"
+minifb = { version = "0.28", default-features = false, features = ["x11", "dlopen"] }
+
+[profile.release]
+opt-level = 3
+debug = 1
