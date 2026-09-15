@@ -13,11 +13,14 @@ zlib tiles. Flat layout, ffmpeg does the codec work.
 
 ## rdesk-rdp (use this one)
 
-    ./target/release/rdesk-rdp --user na --pass SECRET [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M]
+    ./target/release/rdesk-rdp [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--pass FIXED]
 
-First run writes a self-signed cert to `~/.config/rdesk/`; mstsc will warn
-about it once. Log in with the --user/--pass values (they are rdesk's own, not
-the Linux account). Needs `ffmpeg` and `openssl` on PATH, `DISPLAY` set.
+Log in from mstsc as the Linux user running the server, with that user's
+system password (checked through PAM's `unix_chkpwd`, so no password is
+stored anywhere). `--pass` replaces it with a fixed password if you want.
+TLS only, no NLA, same as xrdp: NLA/NTLM would need the password on the server.
+First run writes a self-signed cert to `~/.config/rdesk/`; mstsc warns about it
+once. Needs `ffmpeg` and `openssl` on PATH, `DISPLAY` set.
 
 Input arrives as scancodes and is injected as X keycodes, so the server's
 keyboard layout applies (æøå fine). Frames: XShm grab -> ffmpeg h264_nvenc

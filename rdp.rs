@@ -9,9 +9,9 @@ use anyhow::Context as _;
 use ironrdp_egfx::pdu::{Avc420Region, CapabilitiesAdvertisePdu, CapabilitySet};
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer};
 use ironrdp_server::{
-    Credentials, DesktopSize, DisplayUpdate, EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle,
-    KeyboardEvent, MouseEvent, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler,
-    ServerEvent, ServerEventSender, TlsIdentityCtx,
+    CredentialDecision, CredentialValidationError, CredentialValidator, Credentials, DesktopSize, DisplayUpdate,
+    EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, KeyboardEvent, MouseEvent, RdpServer,
+    RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, ServerEventSender, TlsIdentityCtx,
 };
 use ironrdp_svc::ChannelFlags;
 use core::num::{NonZeroU16, NonZeroUsize};
@@ -56,23 +56,17 @@ fn parse_args() -> Opts {
             "--fps" => o.fps = a.next().expect("--fps N").parse().expect("fps"),
             "--bitrate" => o.bitrate = a.next().expect("--bitrate 12M"),
             "--cpu" => o.cpu = true,
-            "--user" => o.user = a.next().expect("--user NAME"),
             "--pass" => o.pass = a.next().expect("--pass PASSWORD"),
             "--certdir" => o.certdir = a.next().expect("--certdir DIR").into(),
             _ => {
-                eprintln!("usage: rdesk-rdp --user NAME --pass PASSWORD [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--cpu] [--certdir ~/.config/rdesk]");
+                eprintln!("usage: rdesk-rdp [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--cpu] [--certdir ~/.config/rdesk] [--pass STATIC]");
+                eprintln!("login is the Linux user running the server + their password (via unix_chkpwd); --pass replaces that with a fixed one");
                 std::process::exit(2);
             }
         }
     }
-    if o.user.is_empty() || o.pass.is_empty() {
-        o.pass = std::env::var("RDESK_PASS").unwrap_or_default();
-        if o.user.is_empty() { o.user = std::env::var("RDESK_USER").unwrap_or_default(); }
-        if o.user.is_empty() || o.pass.is_empty() {
-            eprintln!("need --user/--pass (or RDESK_USER/RDESK_PASS)");
-            std::process::exit(2);
-        }
-    }
+    o.user = std::env::var("USER").unwrap_or_default();
+    if o.user.is_empty() { eprintln!("USER not set"); std::process::exit(2); }
     o
 }
 
@@ -97,6 +91,46 @@ enum Mode {
     Avc,
     /// Plain bitmap updates through the display handler; IronRDP encodes (RemoteFX/RLE).
     Legacy,
+}
+
+// ---------------------------------------------------------------- login
+
+/// Accepts the Linux user running the server with their system password, checked
+/// by PAM's own setgid helper (unix_chkpwd only verifies the calling user, which
+/// is exactly the scope we want). `--pass` swaps in a fixed password instead.
+struct Login {
+    user: String,
+    fixed: Option<String>,
+}
+
+fn unix_chkpwd(user: &str, pass: &str) -> bool {
+    let mut child = match Command::new("/sbin/unix_chkpwd")
+        .args([user, "nullok"])
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .spawn() { Ok(c) => c, Err(e) => { error!("unix_chkpwd: {}", e); return false } };
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(pass.as_bytes());
+        let _ = si.write_all(&[0]);
+    }
+    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+#[async_trait::async_trait]
+impl CredentialValidator for Login {
+    async fn validate(&self, c: &Credentials) -> Result<CredentialDecision, CredentialValidationError> {
+        // mstsc may send DOMAIN\user or user@domain; only the user part matters here.
+        let user = c.username.rsplit('\\').next().unwrap_or("").split('@').next().unwrap_or("").to_lowercase();
+        let ok = if user != self.user.to_lowercase() {
+            false
+        } else if let Some(fixed) = &self.fixed {
+            c.password == *fixed
+        } else {
+            let (u, p) = (self.user.clone(), c.password.clone());
+            tokio::task::spawn_blocking(move || unix_chkpwd(&u, &p)).await.unwrap_or(false)
+        };
+        info!(user = %c.username, ok, "login");
+        Ok(if ok { CredentialDecision::Accept } else { CredentialDecision::Reject })
+    }
 }
 
 // ---------------------------------------------------------------- input
@@ -480,17 +514,22 @@ async fn main() -> anyhow::Result<()> {
 
     let ev: EvSender = Default::default();
     let addr: std::net::SocketAddr = o.bind.parse().context("--bind")?;
+    let login = Login { user: o.user.clone(), fixed: if o.pass.is_empty() { None } else { Some(o.pass.clone()) } };
+    // TLS without NLA, like xrdp: mstsc sends the typed credentials in ClientInfo
+    // and we check them against the system password. NLA would need the password
+    // stored on the server (NTLM), which is why it is not used here.
     let mut server = RdpServer::builder()
         .with_addr(addr)
-        .with_hybrid(acceptor, identity.pub_key)
+        .with_tls(acceptor)
         .with_input_handler(Input { ctx: ctx.clone() })
         .with_display_handler(Display { ctx: ctx.clone() })
         .with_gfx_factory(Some(Box::new(GfxFactory { ctx: ctx.clone(), ev })))
+        .with_credential_validator(Some(Arc::new(login)))
         .build();
-    server.set_credentials(Some(Credentials { username: o.user.clone(), password: o.pass.clone(), domain: None }));
 
-    info!("rdesk-rdp: {}x{} @{}fps {} encoder={} user={} listening on {}",
-          w, h, o.fps, o.bitrate, if nvenc { "h264_nvenc" } else { "libx264" }, o.user, o.bind);
+    info!("rdesk-rdp: {}x{} @{}fps {} encoder={} login={} ({}) listening on {}",
+          w, h, o.fps, o.bitrate, if nvenc { "h264_nvenc" } else { "libx264" }, o.user,
+          if o.pass.is_empty() { "system password" } else { "--pass" }, o.bind);
     server.run().await?;
     Ok(())
 }
