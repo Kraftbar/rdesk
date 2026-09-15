@@ -1,14 +1,30 @@
 # rdesk
 
-Tiny remote desktop for an X11 box: NVENC-encoded H.264 over TCP instead of
-xrdp's zlib tiles. Two binaries, flat layout, ffmpeg does the codec work.
+Remote desktop for an X11 box with NVENC-encoded H.264 instead of xrdp's
+zlib tiles. Flat layout, ffmpeg does the codec work.
 
-    server.rs   XShm screen grab + cursor overlay -> ffmpeg (h264_nvenc, libx264 fallback) -> TCP
-                client input -> XTest
-    client.rs   TCP -> ffmpeg decode -> minifb window; mouse/keys -> server
-    proto.rs    the 5-message wire format
+    rdp.rs      rdesk-rdp: native RDP server on IronRDP. Plain mstsc connects;
+                video is H.264 AVC420 over the GFX pipeline, legacy RemoteFX for
+                clients without H.264. NLA login with --user/--pass.
+    server.rs   rdesk-server: the earlier custom protocol (Noise-encrypted TCP)
+    client.rs   rdesk-client: custom client for rdesk-server (Linux/Windows)
+    x11cap.rs   XShm grab, cursor overlay, ffmpeg spawn, shared by both servers
+    proto.rs    wire format for server/client
 
-## Run
+## rdesk-rdp (use this one)
+
+    ./target/release/rdesk-rdp --user na --pass SECRET [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M]
+
+First run writes a self-signed cert to `~/.config/rdesk/`; mstsc will warn
+about it once. Log in with the --user/--pass values (they are rdesk's own, not
+the Linux account). Needs `ffmpeg` and `openssl` on PATH, `DISPLAY` set.
+
+Input arrives as scancodes and is injected as X keycodes, so the server's
+keyboard layout applies (æøå fine). Frames: XShm grab -> ffmpeg h264_nvenc
+(AVI-framed so each frame is exact) -> AVC420 WireToSurface. Client frame
+acks throttle capture, so a slow link lowers fps instead of adding lag.
+
+## rdesk-server / rdesk-client
 
     cargo build --release
     ./target/release/rdesk-server [--bind 0.0.0.0:7000] [--fps 30] [--bitrate 12M] [--cpu]

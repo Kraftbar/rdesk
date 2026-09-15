@@ -12,12 +12,26 @@ path = "server.rs"
 name = "rdesk-client"
 path = "client.rs"
 
+# Native RDP server (mstsc-compatible) on IronRDP, H.264 over the GFX pipeline.
+[[bin]]
+name = "rdesk-rdp"
+path = "rdp.rs"
+
 [dependencies]
 x11rb = { version = "0.14", features = ["shm", "xtest", "xfixes"] }
 libc = "0.2"
 snow = "0.9"
 sha2 = "0.10"
 minifb = { version = "0.28", default-features = false, features = ["x11", "dlopen"] }
+ironrdp-server = { version = "0.13", features = ["egfx", "helper"] }
+ironrdp-egfx = "0.3"
+ironrdp-dvc = "0.8"
+ironrdp-svc = "0.8"
+tokio = { version = "1", features = ["rt", "macros", "sync", "net", "time"] }
+async-trait = "0.1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 opt-level = 3
