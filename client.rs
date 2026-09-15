@@ -12,39 +12,43 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 fn main() {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7000".into());
+    let key = key_from_args();
+    let addr = std::env::args().skip(1).find(|a| !a.starts_with("--") && a.contains(':'))
+        .unwrap_or_else(|| { eprintln!("usage: rdesk-client HOST:PORT --key PASSPHRASE [--hwaccel d3d11va]"); std::process::exit(2) });
     let mut sock = TcpStream::connect(&addr).expect("connect");
     sock.set_nodelay(true).ok();
-    assert_eq!(read_u8(&mut sock).unwrap(), MSG_HELLO, "expected HELLO");
-    let w = read_u16(&mut sock).unwrap() as usize;
-    let h = read_u16(&mut sock).unwrap() as usize;
+    let link = Arc::new(Link::client(&mut sock, &key).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1) }));
+    let hello = link.recv(&mut sock).expect("hello");
+    assert!(hello.len() == 5 && hello[0] == MSG_HELLO, "expected HELLO");
+    let w = u16_at(&hello, 1) as usize;
+    let h = u16_at(&hello, 3) as usize;
     eprintln!("rdesk-client: {} is {}x{}", addr, w, h);
 
-    // Software decode, single thread: frame-threading adds a frame of latency per thread.
-    let mut dec = Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error",
-               "-probesize", "32", "-analyzeduration", "0", "-flags", "low_delay",
-               "-threads", "1", "-f", "h264", "-i", "pipe:0",
-               "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1"])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
+    // Single decode thread: frame-threading adds a frame of latency per thread.
+    // --hwaccel d3d11va|dxva2|vaapi|cuda hands decoding to the GPU (frames still come back as bgra).
+    let mut dec = Command::new(ffmpeg_path());
+    dec.args(["-hide_banner", "-loglevel", "error", "-probesize", "32", "-analyzeduration", "0", "-flags", "low_delay"]);
+    if let Some(hw) = arg_after("--hwaccel") { dec.args(["-hwaccel", &hw]); } else { dec.args(["-threads", "1"]); }
+    dec.args(["-f", "h264", "-i", "pipe:0", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1"]);
+    let mut dec = dec.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit())
         .spawn().expect("spawn ffmpeg");
     let mut dec_in = dec.stdin.take().unwrap();
     let mut dec_out = dec.stdout.take().unwrap();
 
     // Network -> decoder.
     let mut rx = sock.try_clone().unwrap();
-    thread::spawn(move || {
-        let mut buf = Vec::new();
-        loop {
-            let kind = match read_u8(&mut rx) { Ok(k) => k, Err(_) => break };
-            if kind != MSG_VIDEO { eprintln!("bad message kind {}", kind); break; }
-            let n = read_u32(&mut rx).unwrap_or(0) as usize;
-            buf.resize(n, 0);
-            if rx.read_exact(&mut buf).is_err() || dec_in.write_all(&buf).is_err() { break; }
-        }
-        eprintln!("connection closed");
-        std::process::exit(0);
-    });
+    {
+        let link = link.clone();
+        thread::spawn(move || {
+            loop {
+                let m = match link.recv(&mut rx) { Ok(m) => m, Err(e) => { eprintln!("recv: {}", e); break } };
+                if m.is_empty() || m[0] != MSG_VIDEO { eprintln!("bad message"); break; }
+                if dec_in.write_all(&m[1..]).is_err() { break; }
+            }
+            eprintln!("connection closed");
+            std::process::exit(0);
+        });
+    }
 
     // Decoder -> latest frame. Only the newest frame is kept so display never lags behind.
     let latest: Arc<Mutex<Option<Vec<u32>>>> = Arc::new(Mutex::new(None));
@@ -95,10 +99,10 @@ fn main() {
                 let p = (bx as u16, by as u16);
                 if p != last_mouse {
                     last_mouse = p;
-                    let mut m = Vec::new();
+                    let mut m = vec![MSG_MOUSE_MOVE];
                     m.extend_from_slice(&p.0.to_be_bytes());
                     m.extend_from_slice(&p.1.to_be_bytes());
-                    send_msg(&mut sock, MSG_MOUSE_MOVE, &m).ok();
+                    link.send(&mut sock, &m).ok();
                 }
             }
         }
@@ -106,32 +110,47 @@ fn main() {
             let down = win.get_mouse_down(*b);
             if down != btn_state[i] {
                 btn_state[i] = down;
-                send_msg(&mut sock, MSG_MOUSE_BTN, &[i as u8 + 1, down as u8]).ok();
+                link.send(&mut sock, &[MSG_MOUSE_BTN, i as u8 + 1, down as u8]).ok();
             }
         }
         if let Some((sx, sy)) = win.get_scroll_wheel() {
             // X11: 4/5 = wheel up/down, 6/7 = wheel left/right. Sign only; one notch per frame.
             let b = if sy > 0.0 { 4 } else if sy < 0.0 { 5 } else if sx < 0.0 { 6 } else if sx > 0.0 { 7 } else { 0 };
             if b != 0 {
-                send_msg(&mut sock, MSG_MOUSE_BTN, &[b, 1]).ok();
-                send_msg(&mut sock, MSG_MOUSE_BTN, &[b, 0]).ok();
+                link.send(&mut sock, &[MSG_MOUSE_BTN, b, 1]).ok();
+                link.send(&mut sock, &[MSG_MOUSE_BTN, b, 0]).ok();
             }
         }
         for k in win.get_keys_pressed(KeyRepeat::No) {
-            if let Some(ks) = keysym(k) { send_key(&mut sock, ks, true); }
+            if let Some(ks) = keysym(k) { send_key(&link, &mut sock, ks, true); }
         }
         for k in win.get_keys_released() {
-            if let Some(ks) = keysym(k) { send_key(&mut sock, ks, false); }
+            if let Some(ks) = keysym(k) { send_key(&link, &mut sock, ks, false); }
         }
     }
     let _ = dec.kill();
 }
 
-fn send_key(sock: &mut TcpStream, ks: u32, pressed: bool) {
-    let mut m = Vec::new();
+fn arg_after(flag: &str) -> Option<String> {
+    let mut a = std::env::args().skip(1);
+    while let Some(k) = a.next() { if k == flag { return a.next(); } }
+    None
+}
+
+/// Prefer an ffmpeg sitting next to our own binary, else whatever PATH has.
+fn ffmpeg_path() -> std::path::PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        let local = exe.with_file_name(if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" });
+        if local.exists() { return local; }
+    }
+    "ffmpeg".into()
+}
+
+fn send_key(link: &Link, sock: &mut TcpStream, ks: u32, pressed: bool) {
+    let mut m = vec![MSG_KEY];
     m.extend_from_slice(&ks.to_be_bytes());
     m.push(pressed as u8);
-    send_msg(sock, MSG_KEY, &m).ok();
+    link.send(sock, &m).ok();
 }
 
 /// minifb Key -> X11 keysym. US-centric: keys minifb has no name for (æøå etc.) are dropped.

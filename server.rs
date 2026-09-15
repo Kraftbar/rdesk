@@ -36,8 +36,9 @@ fn parse_args() -> Opts {
             "--fps" => o.fps = a.next().expect("--fps N").parse().expect("fps"),
             "--bitrate" => o.bitrate = a.next().expect("--bitrate 12M"),
             "--cpu" => o.cpu = true,
+            "--key" => { a.next(); }
             _ => {
-                eprintln!("usage: rdesk-server [--bind 0.0.0.0:7000] [--fps 30] [--bitrate 12M] [--cpu]");
+                eprintln!("usage: rdesk-server --key PASSPHRASE [--bind 0.0.0.0:7000] [--fps 30] [--bitrate 12M] [--cpu]");
                 std::process::exit(2);
             }
         }
@@ -141,23 +142,22 @@ fn build_keymap(conn: &RustConnection) -> HashMap<u32, u8> {
     m
 }
 
-fn handle_input(conn: &RustConnection, root: xproto::Window, keymap: &HashMap<u32, u8>, mut rx: TcpStream) -> std::io::Result<()> {
+fn handle_input(conn: &RustConnection, root: xproto::Window, keymap: &HashMap<u32, u8>,
+                link: &Link, mut rx: TcpStream) -> std::io::Result<()> {
     loop {
-        match read_u8(&mut rx)? {
-            MSG_MOUSE_MOVE => {
-                let x = read_u16(&mut rx)? as i16;
-                let y = read_u16(&mut rx)? as i16;
+        let m = link.recv(&mut rx)?;
+        match (m[0], m.len()) {
+            (MSG_MOUSE_MOVE, 5) => {
+                let (x, y) = (u16_at(&m, 1) as i16, u16_at(&m, 3) as i16);
                 conn.xtest_fake_input(xproto::MOTION_NOTIFY_EVENT, 0, x11rb::CURRENT_TIME, root, x, y, 0).ok();
             }
-            MSG_MOUSE_BTN => {
-                let b = read_u8(&mut rx)?;
-                let pressed = read_u8(&mut rx)? != 0;
+            (MSG_MOUSE_BTN, 3) => {
+                let (b, pressed) = (m[1], m[2] != 0);
                 let t = if pressed { xproto::BUTTON_PRESS_EVENT } else { xproto::BUTTON_RELEASE_EVENT };
                 conn.xtest_fake_input(t, b, x11rb::CURRENT_TIME, root, 0, 0, 0).ok();
             }
-            MSG_KEY => {
-                let ks = read_u32(&mut rx)?;
-                let pressed = read_u8(&mut rx)? != 0;
+            (MSG_KEY, 6) => {
+                let (ks, pressed) = (u32_at(&m, 1), m[5] != 0);
                 if let Some(&kc) = keymap.get(&ks) {
                     let t = if pressed { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT };
                     conn.xtest_fake_input(t, kc, x11rb::CURRENT_TIME, root, 0, 0, 0).ok();
@@ -165,8 +165,8 @@ fn handle_input(conn: &RustConnection, root: xproto::Window, keymap: &HashMap<u3
                     eprintln!("no keycode for keysym 0x{:x}", ks);
                 }
             }
-            k => {
-                eprintln!("bad message kind {}", k);
+            (k, n) => {
+                eprintln!("bad message kind {} len {}", k, n);
                 return Ok(());
             }
         }
@@ -174,13 +174,19 @@ fn handle_input(conn: &RustConnection, root: xproto::Window, keymap: &HashMap<u3
     }
 }
 
-fn handle_client(o: &Opts, conn: &Arc<RustConnection>, root: xproto::Window, w: u16, h: u16,
+fn handle_client(o: &Opts, key: &str, conn: &Arc<RustConnection>, root: xproto::Window, w: u16, h: u16,
                  shm: &Arc<Shm>, keymap: &Arc<HashMap<u32, u8>>, nvenc: bool, mut tx: TcpStream) {
     tx.set_nodelay(true).ok();
-    let mut hello = Vec::new();
+    tx.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let link = match Link::server(&mut tx, key) {
+        Ok(l) => Arc::new(l),
+        Err(e) => { eprintln!("handshake: {}", e); return; }
+    };
+    tx.set_read_timeout(None).ok();
+    let mut hello = vec![MSG_HELLO];
     hello.extend_from_slice(&w.to_be_bytes());
     hello.extend_from_slice(&h.to_be_bytes());
-    if send_msg(&mut tx, MSG_HELLO, &hello).is_err() { return; }
+    if link.send(&mut tx, &hello).is_err() { return; }
 
     let mut enc = spawn_encoder(w, h, o.fps, &o.bitrate, nvenc);
     let mut enc_in = enc.stdin.take().unwrap();
@@ -218,19 +224,20 @@ fn handle_client(o: &Opts, conn: &Arc<RustConnection>, root: xproto::Window, w: 
 
     // Input thread: client events -> XTest.
     let inp = {
-        let (conn, keymap, stop) = (conn.clone(), keymap.clone(), stop.clone());
+        let (conn, keymap, stop, link) = (conn.clone(), keymap.clone(), stop.clone(), link.clone());
         let rx = tx.try_clone().unwrap();
         thread::spawn(move || {
-            let _ = handle_input(&conn, root, &keymap, rx);
+            let _ = handle_input(&conn, root, &keymap, &link, rx);
             stop.store(true, Ordering::Relaxed);
         })
     };
 
     // This thread: ffmpeg stdout -> socket.
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; 32 * 1024 + 1];
+    buf[0] = MSG_VIDEO;
     while !stop.load(Ordering::Relaxed) {
-        let n = match enc_out.read(&mut buf) { Ok(0) | Err(_) => break, Ok(n) => n };
-        if send_video(&mut tx, &buf[..n]).is_err() { break; }
+        let n = match enc_out.read(&mut buf[1..]) { Ok(0) | Err(_) => break, Ok(n) => n };
+        if link.send(&mut tx, &buf[..n + 1]).is_err() { break; }
     }
     stop.store(true, Ordering::Relaxed);
     tx.shutdown(Shutdown::Both).ok();
@@ -242,6 +249,7 @@ fn handle_client(o: &Opts, conn: &Arc<RustConnection>, root: xproto::Window, w: 
 
 fn main() {
     let o = parse_args();
+    let key = key_from_args();
     let (conn, screen_num) = x11rb::connect(None).expect("connect to X (DISPLAY set?)");
     let conn = Arc::new(conn);
     let screen = &conn.setup().roots[screen_num];
@@ -260,7 +268,7 @@ fn main() {
     for s in listener.incoming() {
         let Ok(s) = s else { continue };
         eprintln!("client connected: {}", s.peer_addr().map(|a| a.to_string()).unwrap_or_default());
-        handle_client(&o, &conn, root, w, h, &shm, &keymap, nvenc, s);
+        handle_client(&o, &key, &conn, root, w, h, &shm, &keymap, nvenc, s);
         eprintln!("client gone");
     }
 }
