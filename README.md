@@ -61,6 +61,28 @@ inclusive and derives the WireToSurface destRect as right+1/bottom+1. Pass
 silently resets the pipeline (re-advertises caps) on the first frame, then
 disconnects.
 
+## Limits and roadmap
+
+Against a Windows RDP host the gap today is, in order of how much you feel it:
+
+1. **Cursor is baked into the video**, so it trails by a frame or two. Windows
+   sends the pointer shape and the client draws it locally; IronRDP has the
+   pointer updates, so this is small.
+2. **Fixed-rate full-frame capture**: 30 encodes/s even when nothing moves.
+   XDamage-driven capture would make idle cost nothing and let motion go faster.
+3. **4:2:0 chroma**: coloured small text is soft. mstsc takes AVC444 (two H.264
+   streams); ironrdp-egfx can send it, the chroma packing is the work.
+4. **No clipboard, no sound.** IronRDP has both channels (cliprdr, rdpsnd).
+5. **Phone gets the bitmap path** because the iOS app disables AVC. A GFX
+   planar/tile path with damage tracking would make it snappy.
+6. **Login needs saved credentials in mstsc** (TLS without NLA). NLA with the
+   system password would mean keeping the NT hash on the server.
+7. One client at a time (IronRDP), one monitor, no dynamic resize: structural,
+   and none of them are what makes it feel slow.
+
+Not planned: a Windows-style per-client virtual desktop. The point of rdesk is
+the live desktop with its open windows; a second session was tried and rejected.
+
 ## rdesk-server / rdesk-client
 
     cargo build --release
