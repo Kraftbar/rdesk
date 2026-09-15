@@ -93,7 +93,7 @@ fn handle_client(o: &Opts, key: &str, conn: &Arc<RustConnection>, root: xproto::
     hello.extend_from_slice(&h.to_be_bytes());
     if link.send(&mut tx, &hello).is_err() { return; }
 
-    let mut enc = spawn_encoder(w, h, o.fps, &o.bitrate, nvenc, "h264");
+    let mut enc = spawn_encoder(w, h, o.fps, &o.bitrate, nvenc, "h264", None);
     let mut enc_in = enc.stdin.take().unwrap();
     let mut enc_out = enc.stdout.take().unwrap();
     let stop = Arc::new(AtomicBool::new(false));

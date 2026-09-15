@@ -46,22 +46,32 @@ pub fn probe_nvenc() -> bool {
 }
 
 /// `container` is "h264" (raw Annex-B) or "avi" (one RIFF chunk per frame, exact sizes).
-pub fn spawn_encoder(w: u16, h: u16, fps: u32, bitrate: &str, nvenc: bool, container: &str) -> Child {
+/// `out` scales the encoded picture to a different size (None = native).
+pub fn spawn_encoder(w: u16, h: u16, fps: u32, bitrate: &str, nvenc: bool, container: &str, vf: Option<&str>) -> Child {
     let size = format!("{}x{}", w, h);
     let fps_s = fps.to_string();
     let mut c = Command::new("ffmpeg");
     c.args(["-hide_banner", "-loglevel", "error",
             "-f", "rawvideo", "-pix_fmt", "bgra", "-video_size", &size, "-framerate", &fps_s,
             "-i", "pipe:0", "-an"]);
+    if let Some(vf) = vf {
+        c.args(["-vf", vf]);
+    }
+    // The raw-h264 pipe (rdesk-server) needs AUDs so the client parser can cut
+    // frames; the AVI path (rdesk-rdp) gets exact frame sizes from the container
+    // and sends the cleanest possible stream to picky decoders (mstsc): no AUD,
+    // VBR-capped instead of CBR so NVENC emits no filler NALs.
+    let raw = container == "h264";
     if nvenc {
         // bgra straight into NVENC: colour conversion happens on the GPU.
-        c.args(["-c:v", "h264_nvenc", "-pix_fmt", "bgra", "-preset", "p1", "-tune", "ll",
-                "-rc", "cbr", "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate,
-                "-g", "600", "-bf", "0", "-zerolatency", "1", "-delay", "0", "-aud", "1"]);
+        c.args(["-c:v", "h264_nvenc", "-pix_fmt", "bgra", "-preset", "p1", "-tune", "ll", "-profile:v", "baseline",
+                "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate,
+                "-g", "600", "-bf", "0", "-zerolatency", "1", "-delay", "0"]);
+        c.args(if raw { ["-rc", "cbr", "-aud", "1"] } else { ["-rc", "vbr", "-aud", "0"] });
     } else {
         c.args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", "-tune", "zerolatency",
-                "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate,
-                "-g", "600", "-bf", "0", "-aud", "1"]);
+                "-profile:v", "baseline", "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", bitrate,
+                "-g", "600", "-bf", "0", "-aud", if raw { "1" } else { "0" }]);
     }
     c.args(["-f", container, "-flush_packets", "1", "pipe:1"]);
     c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());

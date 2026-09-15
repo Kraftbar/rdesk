@@ -2550,6 +2550,7 @@ dependencies = [
  "async-trait",
  "ironrdp-dvc",
  "ironrdp-egfx",
+ "ironrdp-pdu",
  "ironrdp-server",
  "ironrdp-svc",
  "libc",
