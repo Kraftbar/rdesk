@@ -4,6 +4,14 @@ Work notes
 How it works
 ------------
 
+Codecs: H.264 AVC420 over GFX for mstsc; planar dirty rectangles over GFX
+for clients that refuse H.264 (iOS); IronRDP bitmap updates for clients
+without GFX. A self-signed certificate is written to --certdir on first run.
+
+Old rdesk-server/rdesk-client: `rdesk-server [--bind 0.0.0.0:7000] [--fps
+30] [--bitrate 12M] [--cpu]`, `rdesk-client HOST:7000`. Noise over TCP, no
+auth; LAN or SSH tunnel only. Superseded by rdesk-rdp.
+
 Capture: XShm grab of the root window at --fps, XFIXES cursor blended in.
 Encode: raw BGRA piped to ffmpeg h264_nvenc (constrained baseline, no
 B-frames, VBR-capped so no filler NALs), AVI-framed so each access unit
@@ -17,10 +25,11 @@ through the X keymap; characters the layout lacks get bound to a spare
 keycode on the fly.
 
 Session size: negotiated at the client's size (with_honor_client_desktop_size)
-and the screen scaled into it, letterboxed, mouse mapped back. Window mode
-for small clients: a client-sized 1:1 crop that pans when the pointer is
-pushed into a 48 px border. The encoder is fed the cropped frame so the
-window moves per frame.
+and the screen scaled into it, letterboxed, mouse mapped back. A client that
+would shrink the screen below 45 % (a phone held upright) gets a client-sized
+1:1 crop instead, panned when the pointer is pushed into a 48 px border;
+--viewport forces that for every smaller client. The encoder is fed the
+cropped frame so the window moves per frame.
 
 Clients that refuse H.264 (the iOS Windows app sets AVC_DISABLED) still get
 GFX: the client-sized frame is diffed in 64 px tiles, changed spans are sent
