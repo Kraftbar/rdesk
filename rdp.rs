@@ -597,7 +597,7 @@ impl GraphicsPipelineHandler for Gfx {
         self.ctx.acked.store(frame_id, Ordering::Relaxed);
     }
     fn on_qoe_metrics(&mut self, m: ironrdp_egfx::server::QoeMetrics) {
-        info!(?m, "qoe");
+        tracing::debug!(?m, "qoe");
     }
     fn on_ready(&mut self, negotiated: &CapabilitySet) {
         info!(?negotiated, "gfx ready");
@@ -962,6 +962,7 @@ fn ensure_cert(dir: &PathBuf) -> anyhow::Result<(PathBuf, PathBuf)> {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,ironrdp_server::encoder=error".into()))
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .compact().init();
     let o = parse_args();
 
