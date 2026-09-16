@@ -1018,6 +1018,19 @@ async fn main() -> anyhow::Result<()> {
     // otherwise hold the loop for the kernel's ~15 min of retransmits while new
     // clients queue up unanswered. TCP_USER_TIMEOUT on the listener is inherited
     // by accepted sockets and ends such a connection after 20 s of no ACKs.
+    // As a system service rdesk mirrors :0 from the login screen on. LightDM
+    // restarts the X server on logout, which leaves us with a dead connection;
+    // exit on that and let systemd start a fresh one.
+    {
+        let ctx = ctx.clone();
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(3));
+            if ctx.conn.get_input_focus().and_then(|c| Ok(c.reply())).map(|r| r.is_err()).unwrap_or(true) {
+                error!("X connection lost, exiting for a restart");
+                std::process::exit(1);
+            }
+        });
+    }
     let listener = std::net::TcpListener::bind(addr).with_context(|| format!("bind {}", addr))?;
     {
         use std::os::fd::AsRawFd;

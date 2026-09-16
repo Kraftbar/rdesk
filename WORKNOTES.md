@@ -92,6 +92,14 @@ ss -tan '( sport = :3390 )' before touching code.
 Limits and roadmap
 ------------------
 
+Next: login after a reboot. rdesk runs as the user, so :0 only exists once
+someone has logged in at the keyboard. LightDM's login screen is an X server
+on :0 too, owned by root. Run rdesk as a system service with LightDM's
+cookie (XAUTHORITY=/var/run/lightdm/root/:0, USER=nybo) and it mirrors the
+login screen: RDP in after a reboot, type the password into Mint's login
+screen, Cinnamon starts, same X server, same session. A unit file, not code.
+LightDM restarts X on logout; Restart=always covers it.
+
 Against a Windows host, in order of how much you feel it:
 
 1. Cursor is baked into the video and trails by a frame or two. Windows

@@ -1,12 +1,15 @@
 [Unit]
-Description=rdesk-rdp: RDP server mirroring :0 (port 3390)
-After=default.target
+Description=rdesk-rdp: RDP server mirroring :0 from the login screen on (port 3390)
+After=display-manager.service
+Wants=display-manager.service
 
 [Service]
-Environment=DISPLAY=:0
-ExecStart=%h/rdesk/target/release/rdesk-rdp --bind 0.0.0.0:3390
+# Root, with LightDM's cookie: sees the greeter's X server and the session that
+# follows on it. USER/HOME select the account to log in as and its ~/.config/rdesk.
+Environment=DISPLAY=:0 XAUTHORITY=/var/run/lightdm/root/:0 USER=nybo HOME=/home/nybo
+ExecStart=/home/nybo/rdesk/target/release/rdesk-rdp --bind 0.0.0.0:3390
 Restart=always
 RestartSec=5
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical.target
