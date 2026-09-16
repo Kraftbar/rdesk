@@ -981,6 +981,22 @@ async fn main() -> anyhow::Result<()> {
     let ctx = Arc::new(Ctx { conn, root, w, h, shm, fps: o.fps, bitrate: o.bitrate.clone(), nvenc, mode: Mutex::new(Mode::Unknown), out: Mutex::new((w, h)),
                              viewport: o.viewport, view: Mutex::new((0, 0)), acked: AtomicU32::new(u32::MAX), acked_suspended: AtomicBool::new(false) });
 
+    // Started as root (system service) only to read LightDM's X cookie: the X
+    // connection and its shm are set up now, so become the login user before
+    // touching the network or the home directory.
+    if unsafe { libc::getuid() } == 0 {
+        let name = std::ffi::CString::new(o.user.as_str())?;
+        let pw = unsafe { libc::getpwnam(name.as_ptr()) };
+        anyhow::ensure!(!pw.is_null(), "no such user: {}", o.user);
+        let (uid, gid) = unsafe { ((*pw).pw_uid, (*pw).pw_gid) };
+        unsafe {
+            anyhow::ensure!(libc::initgroups(name.as_ptr(), gid) == 0, "initgroups");
+            anyhow::ensure!(libc::setgid(gid) == 0, "setgid");
+            anyhow::ensure!(libc::setuid(uid) == 0, "setuid");
+        }
+        info!("dropped root, running as {} ({})", o.user, uid);
+    }
+
     let (cert, key) = ensure_cert(&o.certdir)?;
     let identity = TlsIdentityCtx::init_from_paths(&cert, &key).context("TLS identity")?;
     let acceptor = identity.make_acceptor().context("TLS acceptor")?;

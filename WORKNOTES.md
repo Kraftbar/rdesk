@@ -66,8 +66,12 @@ Looks exactly like a codec problem.
 The iOS app rejects ironrdp's planar RLE (channel close) but takes raw
 planes. Not investigated which side is wrong.
 
-The iOS app never sends Display Control layout changes on rotation, so
-server-side resize handling does nothing for it. Tried twice, reverted.
+Dynamic resize: neither client sent a Display Control layout change in
+practice — the iOS app never does on rotation, and mstsc did not on window
+resize either (its default smart-sizing scales locally instead). Handling
+was implemented three times and rolled back three times. Don't again unless
+the log shows a layout PDU arriving (ironrdp_server=debug: "Requesting
+layout").
 
 mstsc without NLA never sends a typed password, only a saved one.
 
@@ -92,13 +96,14 @@ ss -tan '( sport = :3390 )' before touching code.
 Limits and roadmap
 ------------------
 
-Next: login after a reboot. rdesk runs as the user, so :0 only exists once
-someone has logged in at the keyboard. LightDM's login screen is an X server
-on :0 too, owned by root. Run rdesk as a system service with LightDM's
-cookie (XAUTHORITY=/var/run/lightdm/root/:0, USER=nybo) and it mirrors the
-login screen: RDP in after a reboot, type the password into Mint's login
-screen, Cinnamon starts, same X server, same session. A unit file, not code.
-LightDM restarts X on logout; Restart=always covers it.
+Login after a reboot: rdesk runs as a system service started as root with
+LightDM's cookie (XAUTHORITY=/var/run/lightdm/root/:0, USER=nybo), connects
+to :0, then drops to USER before opening the network, so it mirrors the
+login screen and the session that follows on the same X server. RDP
+in, type the password into Mint's login screen, Cinnamon starts. LightDM
+restarts X on logout; a watchdog exits on a dead X connection and systemd
+starts a fresh one. Done 2026-09-16; a per-user unit only works once someone
+has logged in at the keyboard.
 
 Against a Windows host, in order of how much you feel it:
 

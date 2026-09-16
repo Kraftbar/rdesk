@@ -37,5 +37,9 @@ mstsc must have it saved. With: NLA, mstsc prompts.
 Service
 -------
 
-    cp rdesk-rdp.service ~/.config/systemd/user/
-    systemctl --user enable --now rdesk-rdp
+    sudo cp rdesk-rdp.service /etc/systemd/system/
+    sudo systemctl enable --now rdesk-rdp
+
+Starts as root to read LightDM's X cookie, then drops to USER; serves the
+login screen after a reboot and the session that follows. Edit USER/HOME in
+the unit.
