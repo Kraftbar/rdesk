@@ -23,10 +23,11 @@ libc = "0.2"
 snow = "0.9"
 sha2 = "0.10"
 minifb = { version = "0.28", default-features = false, features = ["x11", "dlopen"] }
-ironrdp-server = { version = "0.13", features = ["egfx", "helper"] }
+ironrdp-server = { version = "0.13", features = ["egfx", "helper", "nscodec"] }
 ironrdp-egfx = "0.3"
 ironrdp-dvc = "0.8"
 ironrdp-pdu = "0.9"
+ironrdp-graphics = "0.9"
 ironrdp-svc = "0.8"
 tokio = { version = "1", features = ["rt", "macros", "sync", "net", "time"] }
 async-trait = "0.1"

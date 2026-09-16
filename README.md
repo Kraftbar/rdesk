@@ -21,9 +21,11 @@ Two login modes:
   server with that user's system password, checked through PAM's `unix_chkpwd`
   (nothing stored). mstsc only sends a password it has *saved* to a non-NLA
   server, so tick "Allow me to save credentials" or it will just reprompt.
-- `--pass FIXED`: NLA (CredSSP/NTLM) with a fixed password; mstsc prompts each
-  time. NTLM needs the password on the server, which is why the system
-  password can't be used here.
+- `--pass FIXED` or `--pass-file PATH` (default `~/.config/rdesk/password`
+  when it exists, mode 600): NLA (CredSSP/NTLM) with a dedicated rdesk
+  password; mstsc prompts each time, nothing saved on the client. NTLM needs
+  the password on the server, which is why the system password can't be
+  used here. Username is still the Linux user running the server.
 
 First run writes a self-signed cert to `~/.config/rdesk/`; mstsc warns about it
 once. Needs `ffmpeg` and `openssl` on PATH, `DISPLAY` set.

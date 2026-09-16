@@ -8,8 +8,11 @@ mod x11cap;
 use anyhow::Context as _;
 use ironrdp_egfx::pdu::{
     Avc420Region, CapabilitiesAdvertisePdu, CapabilitiesV103Flags, CapabilitiesV104Flags, CapabilitiesV107Flags,
-    CapabilitiesV10Flags, CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet,
+    CapabilitiesV10Flags, CapabilitiesV81Flags, CapabilitiesV8Flags, CapabilitySet, Codec1Type, EndFramePdu, GfxPdu,
+    PixelFormat as GfxPixelFormat, StartFramePdu, Timestamp, WireToSurface1Pdu,
 };
+use ironrdp_graphics::rdp6::{BgrAChannels, BitmapStreamEncoder};
+use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer};
 use ironrdp_server::{
     CredentialDecision, CredentialValidationError, CredentialValidator, Credentials, DesktopSize, DisplayUpdate,
@@ -24,7 +27,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -58,6 +61,7 @@ fn parse_args() -> Opts {
         user: String::new(), pass: String::new(), certdir: PathBuf::from(format!("{}/.config/rdesk", home)),
         viewport: false,
     };
+    let mut pass_file: Option<PathBuf> = None;
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
         match k.as_str() {
@@ -66,10 +70,12 @@ fn parse_args() -> Opts {
             "--bitrate" => o.bitrate = a.next().expect("--bitrate 12M"),
             "--cpu" => o.cpu = true,
             "--pass" => o.pass = a.next().expect("--pass PASSWORD"),
+            "--pass-file" => pass_file = Some(PathBuf::from(a.next().expect("--pass-file PATH"))),
             "--certdir" => o.certdir = a.next().expect("--certdir DIR").into(),
             "--viewport" => o.viewport = true,
             _ => {
-                eprintln!("usage: rdesk-rdp [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--cpu] [--certdir ~/.config/rdesk] [--pass STATIC] [--viewport]");
+                eprintln!("usage: rdesk-rdp [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--cpu] [--certdir ~/.config/rdesk] [--pass STATIC | --pass-file PATH] [--viewport]");
+                eprintln!("       --pass-file defaults to ~/.config/rdesk/password when that file exists (mode 600); NLA, mstsc prompts each time");
                 eprintln!("--viewport: every smaller client gets the 1:1 window onto the screen (default: only when it would shrink below 45 %, i.e. phones)");
                 eprintln!("login: Linux user running the server + system password (mstsc must have the credentials saved),");
                 eprintln!("       or --pass PASSWORD for NLA with a fixed password (mstsc prompts each time)");
@@ -79,6 +85,25 @@ fn parse_args() -> Opts {
     }
     o.user = std::env::var("USER").unwrap_or_default();
     if o.user.is_empty() { eprintln!("USER not set"); std::process::exit(2); }
+    // A dedicated rdesk password in a file gives the Windows experience: NLA,
+    // mstsc asks every time, nothing has to be saved on the client. (NTLM needs
+    // the password server-side, so this is not the Linux password.)
+    let default_file = o.certdir.join("password");
+    if o.pass.is_empty() {
+        if let Some(f) = pass_file.or_else(|| default_file.exists().then_some(default_file)) {
+            match std::fs::read_to_string(&f) {
+                Ok(p) => {
+                    o.pass = p.trim_end_matches(['\r', '\n']).to_string();
+                    if o.pass.is_empty() { eprintln!("{} is empty", f.display()); std::process::exit(2); }
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(m) = std::fs::metadata(&f) {
+                        if m.permissions().mode() & 0o077 != 0 { eprintln!("warning: {} is readable by others (chmod 600)", f.display()); }
+                    }
+                }
+                Err(e) => { eprintln!("{}: {}", f.display(), e); std::process::exit(2); }
+            }
+        }
+    }
     o
 }
 
@@ -100,6 +125,10 @@ struct Ctx {
     viewport: bool,
     /// Top-left screen coordinate of that window.
     view: Mutex<(u16, u16)>,
+    /// Last frame id the client acknowledged (planar path paces on this),
+    /// u32::MAX = none yet; `acked_suspended` once it said it will stop acking.
+    acked: AtomicU32,
+    acked_suspended: AtomicBool,
 }
 
 impl Ctx {
@@ -562,7 +591,10 @@ impl GraphicsPipelineHandler for Gfx {
         caps
     }
     fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32, total_frames_decoded: u32) {
-        info!(frame_id, queue_depth, total_frames_decoded, "frame ack");
+        tracing::debug!(frame_id, queue_depth, total_frames_decoded, "frame ack");
+        // 0xFFFFFFFF = SUSPEND_FRAME_ACKNOWLEDGEMENT: no more acks are coming.
+        if queue_depth == u32::MAX { self.ctx.acked_suspended.store(true, Ordering::Relaxed); }
+        self.ctx.acked.store(frame_id, Ordering::Relaxed);
     }
     fn on_qoe_metrics(&mut self, m: ironrdp_egfx::server::QoeMetrics) {
         info!(?m, "qoe");
@@ -613,13 +645,8 @@ fn stream(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<Atomic
     let (w, h) = (ctx.w, ctx.h);
     let fit = ctx.fit();
     let (sw, sh) = (fit.ow, fit.oh);
-    let surface = {
+    let (surface, avc) = {
         let mut g = handle.lock().unwrap();
-        if !g.supports_avc420() {
-            info!("client has GFX but no AVC420, using legacy bitmap updates");
-            *ctx.mode.lock().unwrap() = Mode::Legacy;
-            return Ok(());
-        }
         // ResetGraphics with a real monitor definition; the bare one create_surface
         // would send has none, and mstsc is stricter than FreeRDP about that.
         g.resize_with_monitors(sw, sh, vec![Monitor {
@@ -629,10 +656,8 @@ fn stream(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<Atomic
         g.map_surface_to_output(sid, 0, 0);
         flush(&mut g, &ev)?;
         *ctx.mode.lock().unwrap() = Mode::Avc;
-        sid
+        (sid, g.supports_avc420())
     };
-    info!(surface, "streaming {}x{} as {}x{}", w, h, sw, sh);
-
     // RDESK_TEST=uncompressed: skip H.264 entirely and push a small raw bitmap
     // every 500 ms, to tell GFX plumbing problems apart from codec problems.
     if std::env::var("RDESK_TEST").as_deref() == Ok("uncompressed") {
@@ -653,6 +678,14 @@ fn stream(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<Atomic
         }
         return Ok(());
     }
+    if !avc {
+        info!(surface, "client has GFX but no AVC420: planar dirty rectangles, {}x{} as {}x{}", w, h, sw, sh);
+        ctx.acked.store(u32::MAX, Ordering::Relaxed);
+        ctx.acked_suspended.store(false, Ordering::Relaxed);
+        return stream_planar(ctx, ev, handle, stop, surface);
+    }
+    info!(surface, "streaming {}x{} as {}x{}", w, h, sw, sh);
+
 
     let win = fit.win.is_some();
     let (ew, eh) = if win { (sw, sh) } else { (w, h) };
@@ -721,6 +754,153 @@ fn stream(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<Atomic
     cap.join().ok();
     info!("stream ended");
     r
+}
+
+/// A GFX PDU encoded and wrapped in a ZGFX segment, ready for the DVC. Every
+/// GFX PDU on the wire is inside RDP_SEGMENTED_DATA; ironrdp does this in
+/// drain_output for its own queue, this is the same for PDUs we build ourselves.
+struct Zgfx(Vec<u8>);
+
+impl ironrdp_pdu::ironrdp_core::Encode for Zgfx {
+    fn encode(&self, dst: &mut ironrdp_pdu::ironrdp_core::WriteCursor<'_>) -> ironrdp_pdu::ironrdp_core::EncodeResult<()> {
+        dst.write_slice(&self.0);
+        Ok(())
+    }
+    fn name(&self) -> &'static str { "ZGFX" }
+    fn size(&self) -> usize { self.0.len() }
+}
+impl ironrdp_dvc::DvcEncode for Zgfx {}
+
+fn zgfx(pdu: GfxPdu) -> ironrdp_dvc::DvcMessage {
+    use ironrdp_pdu::ironrdp_core::{Encode as _, WriteCursor};
+    let mut bytes = vec![0u8; pdu.size()];
+    pdu.encode(&mut WriteCursor::new(&mut bytes)).expect("GfxPdu encode");
+    Box::new(Zgfx(ironrdp_graphics::zgfx::wrap_uncompressed(&bytes)))
+}
+
+/// GFX for clients that refuse H.264 (the iOS Windows app): the client-sized
+/// frame is diffed against the previous one in 64 px tiles and the changed
+/// spans go out as RDP6 planar (RLE) WireToSurface rectangles, at most two
+/// frames in flight so the client's decode speed sets the pace.
+fn stream_planar(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<AtomicBool>, surface: u16) -> anyhow::Result<()> {
+    const T: usize = 64;
+    let (w, h) = (ctx.w, ctx.h);
+    let period = Duration::from_secs_f64(1.0 / ctx.fps as f64);
+    let t0 = Instant::now();
+    let mut prev: Option<(Vec<u8>, u16, u16)> = None;
+    // Rectangles not yet sent because a frame was full (see BUDGET).
+    let mut pending: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut frame_id = 0u32;
+    let mut next = Instant::now();
+    let mut stats = (0u64, 0usize, Instant::now());
+    while !stop.load(Ordering::Relaxed) {
+        // Wait for acks (unless the client suspended them) before the next frame.
+        loop {
+            if stop.load(Ordering::Relaxed) { return Ok(()); }
+            let acked = ctx.acked.load(Ordering::Relaxed);
+            let inflight: u32 = std::env::var("RDESK_INFLIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+            // frame_id = frames sent so far; acked = last acked id (u32::MAX = none yet / suspended).
+            let unacked = if acked == u32::MAX { frame_id } else { frame_id.saturating_sub(acked + 1) };
+            if ctx.acked_suspended.load(Ordering::Relaxed) || unacked < inflight { break; }
+            thread::sleep(Duration::from_millis(1));
+        }
+        grab(&ctx)?;
+        let fit = ctx.fit();
+        let cur = fit.bitmap(ctx.shm.buf(), w, h);
+        let (ow, oh) = (fit.ow as usize, fit.oh as usize);
+        // Dirty spans: runs of changed 64x64 tiles per tile row (whole frame the first time
+        // or when the client size changed).
+        let mut rects: Vec<(usize, usize, usize, usize)> = std::mem::take(&mut pending);
+        match &prev {
+            Some((p, pw, ph)) if (*pw as usize, *ph as usize) == (ow, oh) => {
+                for ty in (0..oh).step_by(T) {
+                    let th = T.min(oh - ty);
+                    let mut run: Option<usize> = None;
+                    for tx in (0..ow + T).step_by(T) {
+                        let dirty = tx < ow && (0..th).any(|r| {
+                            let o = ((ty + r) * ow + tx) * 4;
+                            let n = T.min(ow - tx) * 4;
+                            cur[o..o + n] != p[o..o + n]
+                        });
+                        match (dirty, run) {
+                            (true, None) => run = Some(tx),
+                            (false, Some(x0)) => { rects.push((x0, ty, tx.min(ow), ty + th)); run = None; }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // First frame (or client size changed): the whole surface, in 64-row
+            // bands so no single WireToSurface PDU gets into the megabytes.
+            _ => { rects.clear(); for ty in (0..oh).step_by(T) { rects.push((0, ty, ow, (ty + T).min(oh))); } }
+        }
+        // The iOS app drops the connection on a multi-megabyte frame (a whole
+        // 992x1850 surface is 5.5 MB raw), so a frame carries at most ~1 MB of
+        // pixels and the rest follows in the next frames.
+        let budget: usize = std::env::var("RDESK_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 20);
+        let mut used = 0usize;
+        let mut i = 0;
+        while i < rects.len() {
+            let (x0, y0, x1, y1) = rects[i];
+            used += (x1 - x0) * (y1 - y0) * 4;
+            i += 1;
+            if used >= budget { break; }
+        }
+        pending = rects.split_off(i);
+        if !rects.is_empty() {
+            let ms = t0.elapsed().as_millis() as u32;
+            let ts = Timestamp { milliseconds: (ms % 1000) as u16, seconds: ((ms / 1000) % 60) as u8,
+                                 minutes: ((ms / 60000) % 60) as u8, hours: ((ms / 3600000) % 24) as u16 };
+            let mut msgs: Vec<ironrdp_dvc::DvcMessage> = vec![zgfx(GfxPdu::StartFrame(StartFramePdu { timestamp: ts, frame_id }))];
+            let mut bytes = 0usize;
+            for &(x0, y0, x1, y1) in &rects {
+                let (rw, rh) = (x1 - x0, y1 - y0);
+                let mut px = Vec::with_capacity(rw * rh * 4);
+                for y in y0..y1 { px.extend_from_slice(&cur[(y * ow + x0) * 4..(y * ow + x1) * 4]); }
+                // RDESK_PLANAR=rle|raw|off: RLE planes, raw planes, or the uncompressed codec.
+                let mode = std::env::var("RDESK_PLANAR").unwrap_or_else(|_| "raw".into());
+                let (codec, out) = if mode == "off" {
+                    (Codec1Type::Uncompressed, px)
+                } else {
+                    let mut out = vec![0u8; rw * rh * 4 + 64];
+                    let mut enc = BitmapStreamEncoder::new(rw, rh);
+                    let n = match enc.encode_bitmap::<BgrAChannels>(&px, &mut out, mode == "rle") {
+                        Ok(n) => n,
+                        Err(_) => enc.encode_bitmap::<BgrAChannels>(&px, &mut out, false).map_err(|e| anyhow::anyhow!("planar: {:?}", e))?,
+                    };
+                    out.truncate(n);
+                    (Codec1Type::Planar, out)
+                };
+                bytes += out.len();
+                msgs.push(zgfx(GfxPdu::WireToSurface1(WireToSurface1Pdu {
+                    surface_id: surface, codec_id: codec, pixel_format: GfxPixelFormat::XRgb,
+                    destination_rectangle: ExclusiveRectangle { left: x0 as u16, top: y0 as u16, right: x1 as u16, bottom: y1 as u16 },
+                    bitmap_data: out,
+                })));
+            }
+            msgs.push(zgfx(GfxPdu::EndFrame(EndFramePdu { frame_id })));
+            frame_id += 1;
+            {
+                let g = handle.lock().unwrap();
+                if !g.is_ready() { anyhow::bail!("gfx channel closed"); }
+                let ch = g.channel_id().context("gfx channel not open")?;
+                let svc = ironrdp_dvc::encode_dvc_messages(ch, msgs, ChannelFlags::SHOW_PROTOCOL)?;
+                let guard = ev.lock().unwrap();
+                guard.as_ref().context("no event sender")?.send(ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages: svc })).ok();
+            }
+            stats.0 += 1; stats.1 += bytes;
+            tracing::debug!(frame_id, rects = rects.len(), bytes, "planar frame");
+        }
+        prev = Some((cur, fit.ow, fit.oh));
+        if stats.2.elapsed() >= Duration::from_secs(5) {
+            info!("planar: {:.1} fps, {:.0} kB/s", stats.0 as f64 / stats.2.elapsed().as_secs_f64(), stats.1 as f64 / stats.2.elapsed().as_secs_f64() / 1000.0);
+            stats = (0, 0, Instant::now());
+        }
+        next += period;
+        let now = Instant::now();
+        if next > now { thread::sleep(next - now); } else { next = now; }
+    }
+    Ok(())
 }
 
 /// Minimal reader for ffmpeg's streamed AVI: yields each `00dc` chunk (one H.264 access unit).
@@ -796,7 +976,7 @@ async fn main() -> anyhow::Result<()> {
     let shm = Arc::new(Shm::new(&conn, w as usize * h as usize * 4));
     let nvenc = !o.cpu && probe_nvenc();
     let ctx = Arc::new(Ctx { conn, root, w, h, shm, fps: o.fps, bitrate: o.bitrate.clone(), nvenc, mode: Mutex::new(Mode::Unknown), out: Mutex::new((w, h)),
-                             viewport: o.viewport, view: Mutex::new((0, 0)) });
+                             viewport: o.viewport, view: Mutex::new((0, 0)), acked: AtomicU32::new(u32::MAX), acked_suspended: AtomicBool::new(false) });
 
     let (cert, key) = ensure_cert(&o.certdir)?;
     let identity = TlsIdentityCtx::init_from_paths(&cert, &key).context("TLS identity")?;
