@@ -793,12 +793,17 @@ fn stream_planar(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc
     let mut frame_id = 0u32;
     let mut next = Instant::now();
     let mut stats = (0u64, 0usize, Instant::now());
+    // Knobs kept from the bring-up: RDESK_PLANAR=rle|raw|off (ironrdp's RLE
+    // planes, raw planes, uncompressed), RDESK_BUDGET bytes per frame,
+    // RDESK_INFLIGHT unacked frames.
+    let mode = std::env::var("RDESK_PLANAR").unwrap_or_else(|_| "raw".into());
+    let budget: usize = std::env::var("RDESK_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 20);
+    let inflight: u32 = std::env::var("RDESK_INFLIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
     while !stop.load(Ordering::Relaxed) {
         // Wait for acks (unless the client suspended them) before the next frame.
         loop {
             if stop.load(Ordering::Relaxed) { return Ok(()); }
             let acked = ctx.acked.load(Ordering::Relaxed);
-            let inflight: u32 = std::env::var("RDESK_INFLIGHT").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
             // frame_id = frames sent so far; acked = last acked id (u32::MAX = none yet / suspended).
             let unacked = if acked == u32::MAX { frame_id } else { frame_id.saturating_sub(acked + 1) };
             if ctx.acked_suspended.load(Ordering::Relaxed) || unacked < inflight { break; }
@@ -837,7 +842,6 @@ fn stream_planar(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc
         // The iOS app drops the connection on a multi-megabyte frame (a whole
         // 992x1850 surface is 5.5 MB raw), so a frame carries at most ~1 MB of
         // pixels and the rest follows in the next frames.
-        let budget: usize = std::env::var("RDESK_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 20);
         let mut used = 0usize;
         let mut i = 0;
         while i < rects.len() {
@@ -857,8 +861,6 @@ fn stream_planar(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc
                 let (rw, rh) = (x1 - x0, y1 - y0);
                 let mut px = Vec::with_capacity(rw * rh * 4);
                 for y in y0..y1 { px.extend_from_slice(&cur[(y * ow + x0) * 4..(y * ow + x1) * 4]); }
-                // RDESK_PLANAR=rle|raw|off: RLE planes, raw planes, or the uncompressed codec.
-                let mode = std::env::var("RDESK_PLANAR").unwrap_or_else(|_| "raw".into());
                 let (codec, out) = if mode == "off" {
                     (Codec1Type::Uncompressed, px)
                 } else {

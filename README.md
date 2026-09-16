@@ -46,22 +46,38 @@ Input arrives as scancodes and is injected as X keycodes, so the server's
 keyboard layout applies (æøå fine). Frames: XShm grab -> ffmpeg h264_nvenc
 (AVI-framed so each frame is exact) -> AVC420 WireToSurface. Client frame
 acks throttle capture, so a slow link lowers fps instead of adding lag.
-Clients with GFX but no H.264 (FreeRDP built without it) fall back to
-IronRDP's bitmap updates.
+Clients with GFX but no H.264 (the iOS "Windows" app disables AVC) get the
+GFX pipeline anyway: the client-sized frame is diffed in 64 px tiles and the
+changed spans go out as planar (raw planes; the app rejects ironrdp's RLE)
+WireToSurface rectangles, at most ~1 MB per frame, two frames in flight, paced
+by the client's frame acks. Clients without GFX at all fall back to IronRDP's
+bitmap updates (NSCodec/RemoteFX/raw, whatever they offer).
 
 IronRDP serves one client at a time; the listener sets `TCP_USER_TIMEOUT`
 (20 s) so a peer that vanishes mid-handshake can't hold the door.
 
+Logs go to the journal (`journalctl --user -u rdesk-rdp`): peer, login result,
+errors, and a 5-second fps/bandwidth summary while streaming.
+
 Diagnostics: `RUST_LOG=info,ironrdp_acceptor=debug,ironrdp_server=debug` logs
 every PDU of the handshake; `RDESK_TRACE=1` logs each GFX flush;
-`RDESK_TEST=uncompressed` sends a raw test bitmap instead of H.264 to tell
-GFX plumbing problems from codec problems.
+`RDESK_TEST=uncompressed` sends a raw test bitmap instead of any codec to tell
+GFX plumbing problems from codec problems; `RDESK_PLANAR=rle|raw|off`,
+`RDESK_BUDGET`, `RDESK_INFLIGHT` tune the planar path.
 
-Gotcha found the hard way: ironrdp-egfx 0.3 takes `Avc420Region` bounds as
-inclusive and derives the WireToSurface destRect as right+1/bottom+1. Pass
-`w-1`/`h-1`; with `w`/`h` the rect overshoots the surface by a pixel and mstsc
-silently resets the pipeline (re-advertises caps) on the first frame, then
-disconnects.
+Gotchas found the hard way:
+
+- ironrdp-egfx 0.3 takes `Avc420Region` bounds as inclusive and derives the
+  WireToSurface destRect as right+1/bottom+1. Pass `w-1`/`h-1`; with `w`/`h`
+  the rect overshoots the surface by a pixel and mstsc silently resets the
+  pipeline (re-advertises caps) on the first frame, then disconnects.
+- ironrdp intersects GFX caps flags with AND, so a client's AVC_DISABLED is
+  lost unless the server sets it too; confirming AVC to a client that
+  disabled it makes the iOS app close the channel.
+- Every GFX PDU on the wire is inside a ZGFX segment. ironrdp wraps its own
+  queue in `drain_output`; PDUs built by hand must go through
+  `ironrdp_graphics::zgfx::wrap_uncompressed` or the client drops the channel
+  (looks exactly like a codec problem).
 
 ## Limits and roadmap
 
@@ -75,10 +91,11 @@ Against a Windows RDP host the gap today is, in order of how much you feel it:
 3. **4:2:0 chroma**: coloured small text is soft. mstsc takes AVC444 (two H.264
    streams); ironrdp-egfx can send it, the chroma packing is the work.
 4. **No clipboard, no sound.** IronRDP has both channels (cliprdr, rdpsnd).
-5. **Phone gets the bitmap path** because the iOS app disables AVC. A GFX
-   planar/tile path with damage tracking would make it snappy.
-6. **Login needs saved credentials in mstsc** (TLS without NLA). NLA with the
-   system password would mean keeping the NT hash on the server.
+5. **Phone bandwidth**: its planar path sends raw planes (3 B/px) because the
+   app rejects ironrdp's RLE; a spec-correct RLE would cut that ~5x on mobile
+   data.
+6. **Login needs saved credentials in mstsc** unless `--pass-file` is used
+   (NLA with a dedicated password).
 7. One client at a time (IronRDP), one monitor, no dynamic resize: structural,
    and none of them are what makes it feel slow.
 
