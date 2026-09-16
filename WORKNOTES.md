@@ -110,7 +110,13 @@ Against a Windows host, in order of how much you feel it:
 1. Cursor is baked into the video and trails by a frame or two. Windows
    sends the pointer shape; IronRDP has the pointer updates. Small.
 2. Fixed-rate full-frame capture, 30 encodes/s even when idle. XDamage
-   would make idle free and motion faster.
+   would make idle free and motion faster. Also: scaling for the laptop runs
+   in swscale (~1.5 cores at 3440x1440→1920x802). hwupload_cuda,scale_cuda
+   cuts ffmpeg from 182 % to 34 % CPU (input must be bgr0, not bgra), but
+   sending the scaled frame as a smaller surface mapped at the letterbox
+   offset rendered wrong in mstsc (tried, reverted). Untried safe variant:
+   GPU scale, hwdownload, pad on the CPU at the small size, full-size
+   surface as today.
 3. 4:2:0 chroma, coloured small text is soft. mstsc takes AVC444 (two H.264
    streams); the chroma packing is the work.
 4. No clipboard, no sound. IronRDP has both channels.
