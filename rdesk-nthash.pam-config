@@ -1,0 +1,6 @@
+Name: rdesk: keep the NLA password hash current
+Default: yes
+Priority: 0
+Auth-Type: Additional
+Auth-Final:
+	optional	pam_exec.so quiet expose_authtok /usr/local/libexec/rdesk-nthash nybo

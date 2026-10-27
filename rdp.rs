@@ -4,6 +4,10 @@
 //! scancodes and is injected with XTest, so the server's keyboard layout applies.
 
 mod x11cap;
+mod nthash;
+mod session;
+mod portrait;
+mod clip;
 
 use anyhow::Context as _;
 use ironrdp_egfx::pdu::{
@@ -15,7 +19,7 @@ use ironrdp_graphics::rdp6::{BgrAChannels, BitmapStreamEncoder};
 use ironrdp_pdu::geometry::ExclusiveRectangle;
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer};
 use ironrdp_server::{
-    CredentialDecision, CredentialValidationError, CredentialValidator, Credentials, DesktopSize, DisplayUpdate,
+    CredentialDecision, CredentialValidationError, CredentialValidator, Credentials, DesktopSize, DisplayUpdate, RGBAPointer,
     EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, KeyboardEvent, MouseEvent, RdpServer,
     RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerEvent, ServerEventSender, TlsIdentityCtx,
 };
@@ -48,20 +52,26 @@ struct Opts {
     cpu: bool,
     user: String,
     pass: String,
+    /// NT hash of the Linux password (hex, from ~/.config/rdesk/nthash): NLA
+    /// with the system password, mstsc prompts like it does for Windows.
+    nthash: Option<String>,
     certdir: PathBuf,
     /// Force the 1:1 window for every client smaller than the screen; by
     /// default only clients that would have to shrink it below 45 % get it.
     viewport: bool,
+    cold_boot: bool,
+    phone_res: bool,
 }
 
 fn parse_args() -> Opts {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let mut o = Opts {
         bind: "0.0.0.0:3390".into(), fps: 30, bitrate: "12M".into(), cpu: false,
-        user: String::new(), pass: String::new(), certdir: PathBuf::from(format!("{}/.config/rdesk", home)),
-        viewport: false,
+        user: String::new(), pass: String::new(), nthash: None, certdir: PathBuf::from(format!("{}/.config/rdesk", home)),
+        viewport: false, cold_boot: false, phone_res: false,
     };
     let mut pass_file: Option<PathBuf> = None;
+    let mut set_password = false;
     let mut a = std::env::args().skip(1);
     while let Some(k) = a.next() {
         match k.as_str() {
@@ -73,11 +83,18 @@ fn parse_args() -> Opts {
             "--pass-file" => pass_file = Some(PathBuf::from(a.next().expect("--pass-file PATH"))),
             "--certdir" => o.certdir = a.next().expect("--certdir DIR").into(),
             "--viewport" => o.viewport = true,
+            "--cold-boot" => o.cold_boot = true,
+            "--phone-res" => o.phone_res = true,
+            "--set-password" => set_password = true,
             _ => {
                 eprintln!("usage: rdesk-rdp [--bind 0.0.0.0:3390] [--fps 30] [--bitrate 12M] [--cpu] [--certdir ~/.config/rdesk] [--pass STATIC | --pass-file PATH] [--viewport]");
                 eprintln!("       --pass-file defaults to ~/.config/rdesk/password when that file exists (mode 600); NLA, mstsc prompts each time");
                 eprintln!("--viewport: every smaller client gets the 1:1 window onto the screen (default: only when it would shrink below 45 %, i.e. phones)");
-                eprintln!("login: Linux user running the server + system password (mstsc must have the credentials saved),");
+                eprintln!("--cold-boot: log in through the rdesk LightDM bridge and set the new desktop to 1920x1080 (TLS/system password only)");
+                eprintln!("--phone-res: temporarily resize the shared desktop for portrait clients; restore it on disconnect");
+                eprintln!("--set-password: store the NT hash of your Linux password in ~/.config/rdesk/nthash now");
+                eprintln!("login: Linux user running the server + system password. NLA (mstsc prompts) once ~/.config/rdesk/nthash");
+                eprintln!("       exists: the rdesk-nthash PAM hook and successful logins keep it current; until then TLS, saved credentials;");
                 eprintln!("       or --pass PASSWORD for NLA with a fixed password (mstsc prompts each time)");
                 std::process::exit(2);
             }
@@ -85,6 +102,13 @@ fn parse_args() -> Opts {
     }
     o.user = std::env::var("USER").unwrap_or_default();
     if o.user.is_empty() { eprintln!("USER not set"); std::process::exit(2); }
+    let hash_file = o.certdir.join("nthash");
+    if set_password {
+        match store_nthash(&o.user, &hash_file) {
+            Ok(()) => { println!("wrote {}; a running rdesk-rdp switches to NLA once idle", hash_file.display()); std::process::exit(0) }
+            Err(e) => { eprintln!("--set-password: {:#}", e); std::process::exit(1) }
+        }
+    }
     // A dedicated rdesk password in a file gives the Windows experience: NLA,
     // mstsc asks every time, nothing has to be saved on the client. (NTLM needs
     // the password server-side, so this is not the Linux password.)
@@ -104,19 +128,40 @@ fn parse_args() -> Opts {
             }
         }
     }
+    if o.pass.is_empty() && hash_file.exists() {
+        o.nthash = nthash::read(&hash_file);
+        if o.nthash.is_none() { eprintln!("{}: unreadable or not 32 hex digits, ignored", hash_file.display()); }
+    }
+    if o.cold_boot && !o.pass.is_empty() {
+        eprintln!("--cold-boot requires the Linux password via TLS; remove --pass/--pass-file and the default password file");
+        std::process::exit(2);
+    }
     o
 }
 
 /// Everything the per-connection pieces need about the machine.
+/// A connection that is still handshaking, or that stopped acking frames and
+/// sending input, gives way to a new one; a live, logged-in one never does
+/// (internet scanners must not be able to kick a session).
+#[derive(Clone, Copy, Debug)]
+enum Activity {
+    Handshake,
+    Authenticating,
+    /// Logged in; last time the client acked a frame or sent input.
+    Active(Instant),
+}
+
+/// How long a logged-in client may be silent before a new connection replaces it.
+const STALE: Duration = Duration::from_secs(10);
+
 struct Ctx {
     conn: Arc<RustConnection>,
     root: xproto::Window,
-    w: u16,
-    h: u16,
-    shm: Arc<Shm>,
+    capture: Mutex<Capture>,
     fps: u32,
     bitrate: String,
-    nvenc: bool,
+    /// Cleared when NVENC stops working (driver updated under a running X).
+    nvenc: AtomicBool,
     /// How frames reach the current client; decided once the GFX channel negotiates.
     mode: Mutex<Mode>,
     /// Desktop size negotiated with the current client (its own size, see `Fit`).
@@ -129,24 +174,69 @@ struct Ctx {
     /// u32::MAX = none yet; `acked_suspended` once it said it will stop acking.
     acked: AtomicU32,
     acked_suspended: AtomicBool,
+    phone_res: bool,
+    phone_desktop: Mutex<Option<portrait::PhoneDesktop>>,
+    /// The client draws the pointer from shapes we send (no trailing cursor);
+    /// RDESK_CURSOR=video bakes it into the frames instead.
+    client_cursor: bool,
+    /// Where the current connection is; decides whether a newer one may replace it.
+    activity: Mutex<Activity>,
+    streams: Mutex<Vec<(Arc<AtomicBool>, thread::JoinHandle<()>)>>,
+    /// Set by a greeter login: the desktop is fresh, size it to the client in
+    /// request_initial_size (the client's size is not known during login).
+    fresh_login: AtomicBool,
 }
 
 impl Ctx {
+    fn end_connection(&self) {
+        // Stop every generation, including ones replaced by GFX renegotiation,
+        // before restoring the display or allowing a new client to start.
+        let streams = std::mem::take(&mut *self.streams.lock().unwrap());
+        for (stop, _) in &streams { stop.store(true, Ordering::Relaxed); }
+        for (_, task) in streams { let _ = task.join(); }
+        let saved = self.phone_desktop.lock().unwrap().take();
+        let _capture = self.capture.lock().unwrap();
+        drop(saved); // restores through the already authenticated X connection
+    }
+    fn set_activity(&self, a: Activity) {
+        *self.activity.lock().unwrap() = a;
+    }
+    /// Frame acks and input only arrive after login (also --pass, which has no validator).
+    fn seen(&self) {
+        self.set_activity(Activity::Active(Instant::now()));
+    }
+    /// Whether a new connection should take over from the current one.
+    fn replaceable(&self) -> bool {
+        match *self.activity.lock().unwrap() {
+            Activity::Handshake => true,
+            Activity::Authenticating => false,
+            Activity::Active(t) => t.elapsed() > STALE && !self.acked_suspended.load(Ordering::Relaxed),
+        }
+    }
+    fn dimensions(&self) -> (u16, u16) {
+        let c = self.capture.lock().unwrap();
+        (c.w, c.h)
+    }
     fn fit(&self) -> Fit {
+        let (w, h) = self.dimensions();
+        self.fit_for(w, h)
+    }
+    fn fit_for(&self, w: u16, h: u16) -> Fit {
         let (ow, oh) = *self.out.lock().unwrap();
-        let scale = (ow as f64 / self.w as f64).min(oh as f64 / self.h as f64);
+        let scale = (ow as f64 / w as f64).min(oh as f64 / h as f64);
         // A phone held upright would shrink the screen to ~0.3; a laptop or a
         // phone on its side sits above 0.5 and reads fine scaled.
         if scale < 1.0 && (self.viewport || scale < 0.45) {
             let (vx, vy) = *self.view.lock().unwrap();
-            return Fit::window(self.w, self.h, ow, oh, vx, vy);
+            return Fit::window(w, h, ow, oh, vx, vy);
         }
-        Fit::new(self.w, self.h, ow, oh)
+        Fit::new(w, h, ow, oh)
     }
     /// Move the viewport so that (vx, vy) is its top-left, clamped to the screen.
     fn pan_to(&self, vx: i32, vy: i32) {
         let f = self.fit();
-        let (mx, my) = (self.w.saturating_sub(f.fw) as i32, self.h.saturating_sub(f.fh) as i32);
+        let (w, h) = self.dimensions();
+        let (mx, my) = (w.saturating_sub(f.fw) as i32, h.saturating_sub(f.fh) as i32);
         *self.view.lock().unwrap() = (vx.clamp(0, mx) as u16, vy.clamp(0, my) as u16);
     }
 }
@@ -157,6 +247,9 @@ impl Ctx {
 /// letterboxed and centred. Identity when the sizes match.
 #[derive(Clone, Copy, Debug)]
 struct Fit {
+    /// A full output rectangle alone does not imply 1:1 pixels: a 720p source
+    /// also fills 1080p. Only skip scaling when source and output sizes match.
+    native: bool,
     /// Client desktop (= surface) size.
     ow: u16, oh: u16,
     /// Screen rectangle inside it (scaled, or 1:1 in window mode), even-aligned for 4:2:0.
@@ -168,20 +261,20 @@ struct Fit {
 impl Fit {
     fn new(w: u16, h: u16, ow: u16, oh: u16) -> Fit {
         if (w, h) == (ow, oh) {
-            return Fit { ow, oh, fx: 0, fy: 0, fw: w, fh: h, win: None };
+            return Fit { native: true, ow, oh, fx: 0, fy: 0, fw: w, fh: h, win: None };
         }
         let s = (ow as f64 / w as f64).min(oh as f64 / h as f64);
         let fw = ((w as f64 * s) as u16).max(2) & !1;
         let fh = ((h as f64 * s) as u16).max(2) & !1;
-        Fit { ow, oh, fx: (ow - fw) / 2 & !1, fy: (oh - fh) / 2 & !1, fw, fh, win: None }
+        Fit { native: false, ow, oh, fx: (ow - fw) / 2 & !1, fy: (oh - fh) / 2 & !1, fw, fh, win: None }
     }
     /// A client-sized window onto the screen at (vx, vy); black where the client is larger.
     fn window(w: u16, h: u16, ow: u16, oh: u16, vx: u16, vy: u16) -> Fit {
         let (fw, fh) = (ow.min(w), oh.min(h));
-        Fit { ow, oh, fx: 0, fy: 0, fw, fh, win: Some((vx.min(w - fw), vy.min(h - fh))) }
+        Fit { native: false, ow, oh, fx: 0, fy: 0, fw, fh, win: Some((vx.min(w - fw), vy.min(h - fh))) }
     }
     fn identity(&self) -> bool {
-        self.win.is_none() && self.fx == 0 && self.fy == 0 && (self.fw, self.fh) == (self.ow, self.oh)
+        self.native
     }
     /// ffmpeg filter producing the client-sized picture, or None when nothing to do.
     /// Window mode crops in `bitmap` instead, so the encoder sees client-sized frames.
@@ -236,41 +329,104 @@ enum Mode {
 
 // ---------------------------------------------------------------- login
 
-/// TLS-mode login: the Linux user running the server with their system password,
-/// checked by PAM's own setgid helper (unix_chkpwd only verifies the calling
-/// user, which is exactly the scope we want).
+/// System-password login (TLS, or the password delegated after NLA): the Linux
+/// user running the server, checked by PAM's own setgid helper (unix_chkpwd only
+/// verifies the calling user, which is exactly the scope we want).
 struct Login {
     user: String,
+    cold_boot: bool,
+    hash_file: PathBuf,
+    ctx: Arc<Ctx>,
 }
 
-fn unix_chkpwd(user: &str, pass: &str) -> bool {
-    let mut child = match Command::new("/sbin/unix_chkpwd")
-        .args([user, "nullok"])
-        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .spawn() { Ok(c) => c, Err(e) => { error!("unix_chkpwd: {}", e); return false } };
-    if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(pass.as_bytes());
-        let _ = si.write_all(&[0]);
+/// Find a vanished client within ~25 s even when nothing is in flight
+/// (TCP_USER_TIMEOUT only covers unacked data).
+fn keepalive(stream: &tokio::net::TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    for (level, opt, val) in [(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1), (libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 10),
+                              (libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 5), (libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3)] {
+        let v: libc::c_int = val;
+        let r = unsafe { libc::setsockopt(fd, level, opt, &v as *const _ as *const libc::c_void, std::mem::size_of_val(&v) as libc::socklen_t) };
+        if r != 0 { warn!("keepalive option {}: {}", opt, std::io::Error::last_os_error()); }
     }
-    child.wait().map(|s| s.success()).unwrap_or(false)
+}
+
+/// Asks for the Linux password, checks it, and stores its NT hash.
+fn store_nthash(user: &str, path: &std::path::Path) -> anyhow::Result<()> {
+    let pass = read_password(&format!("Linux password for {}: ", user))?;
+    anyhow::ensure!(nthash::check(user, &pass), "wrong password for {} (run this as {})", user, user);
+    nthash::store(path, &pass)?;
+    Ok(())
+}
+
+fn read_password(prompt: &str) -> anyhow::Result<String> {
+    eprint!("{}", prompt);
+    let fd = libc::STDIN_FILENO;
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    let tty = unsafe { libc::tcgetattr(fd, &mut old) } == 0;
+    if tty {
+        let mut t = old;
+        t.c_lflag &= !libc::ECHO;
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) };
+    }
+    let mut line = String::new();
+    let r = std::io::stdin().read_line(&mut line);
+    if tty { unsafe { libc::tcsetattr(fd, libc::TCSANOW, &old) }; eprintln!(); }
+    r?;
+    let pass = line.trim_end_matches(['\r', '\n']).to_string();
+    anyhow::ensure!(!pass.is_empty(), "empty password");
+    Ok(pass)
 }
 
 #[async_trait::async_trait]
 impl CredentialValidator for Login {
     async fn validate(&self, c: &Credentials) -> Result<CredentialDecision, CredentialValidationError> {
         // mstsc may send DOMAIN\user or user@domain; only the user part matters here.
+        self.ctx.set_activity(Activity::Authenticating);
         let user = c.username.rsplit('\\').next().unwrap_or("").split('@').next().unwrap_or("").to_lowercase();
         if c.password.is_empty() {
-            warn!(user = %c.username, "client sent no password: in mstsc tick 'Allow me to save credentials' and save them, or run with --pass");
+            warn!(user = %c.username, "client sent no password: run rdesk-rdp --set-password for NLA, or save the credentials in mstsc");
             return Ok(CredentialDecision::Reject);
         }
         let ok = if user != self.user.to_lowercase() {
             false
         } else {
-            let (u, p) = (self.user.clone(), c.password.clone());
-            tokio::task::spawn_blocking(move || unix_chkpwd(&u, &p)).await.unwrap_or(false)
+            let (u, p, ctx, cold_boot) = (self.user.clone(), c.password.clone(), self.ctx.clone(), self.cold_boot);
+            tokio::task::spawn_blocking(move || {
+                if cold_boot {
+                    match session::login(&u, &p) {
+                        Ok(Some(())) => {
+                            info!("LightDM accepted remote login; waiting for the desktop");
+                            if let Err(e) = session::prepare_desktop(&ctx.conn, ctx.root) {
+                                error!("cold-boot desktop: {:#}", e);
+                                return false;
+                            }
+                            ctx.fresh_login.store(true, Ordering::Relaxed);
+                            return true;
+                        }
+                        Ok(None) => {
+                            if !session::desktop_ready(&ctx.conn, ctx.root).unwrap_or(false) {
+                                warn!("cold-boot login unavailable: no bridge and no Cinnamon desktop");
+                                return false;
+                            }
+                            info!("no greeter bridge; authenticating existing desktop");
+                        }
+                        Err(e) => { warn!("LightDM login: {:#}", e); return false; }
+                    }
+                }
+                nthash::check(&u, &p)
+            }).await.unwrap_or(false)
         };
         info!(user = %c.username, domain = ?c.domain, ok, "login");
+        self.ctx.set_activity(if ok { Activity::Active(Instant::now()) } else { Activity::Handshake });
+        if ok {
+            match nthash::store(&self.hash_file, &c.password) {
+                Ok(true) => info!("stored the NT hash for NLA; the server switches to NLA once idle"),
+                Ok(false) => {}
+                Err(e) => warn!("{}: {}", self.hash_file.display(), e),
+            }
+        }
         Ok(if ok { CredentialDecision::Accept } else { CredentialDecision::Reject })
     }
 }
@@ -284,6 +440,10 @@ struct Input {
     /// A keycode with no keysyms, temporarily bound to characters the layout
     /// lacks (emoji etc.), the way xdotool types them.
     spare: Option<(u8, u32)>,
+    /// Ctrl held (either side), for the phone zoom mapping in `key`.
+    ctrl: bool,
+    /// Keycodes that numpad +/- presses were remapped to, so releases match.
+    remapped: HashMap<u8, u8>,
 }
 
 impl Input {
@@ -297,7 +457,23 @@ impl Input {
     fn click(&self, b: u8, n: i32) {
         for _ in 0..n.max(1) { self.button(b, true); self.button(b, false); }
     }
-    fn key(&self, code: u8, extended: bool, pressed: bool) {
+    fn key(&mut self, code: u8, extended: bool, pressed: bool) {
+        if code == 0x1d { self.ctrl = pressed; }
+        // The iOS Windows app sends Ctrl + '+' / '-' as Ctrl + numpad plus/minus,
+        // which browsers here ignore for zoom. With Ctrl held, type the layout's
+        // main-row '+' / '-' keys instead (zoom in / out from a phone).
+        if !extended && (code == 0x4e || code == 0x4a) {
+            let kc = if pressed && self.ctrl {
+                if self.keysyms.is_none() { self.keysyms = Some(self.build_keysyms()); }
+                let ks = if code == 0x4e { 0x2b } else { 0x2d };
+                self.keysyms.as_ref().unwrap().get(&ks).filter(|&&(_, shift)| !shift).map(|&(kc, _)| kc)
+            } else if !pressed { self.remapped.remove(&code) } else { None };
+            if let Some(kc) = kc {
+                if pressed { self.remapped.insert(code, kc); }
+                self.fake(if pressed { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT }, kc, 0, 0);
+                return;
+            }
+        }
         match keycode(code, extended) {
             Some(kc) => self.fake(if pressed { xproto::KEY_PRESS_EVENT } else { xproto::KEY_RELEASE_EVENT }, kc, 0, 0),
             None => warn!(code, extended, "unmapped scancode"),
@@ -384,6 +560,12 @@ fn keycode(code: u8, extended: bool) -> Option<u8> {
 
 impl RdpServerInputHandler for Input {
     fn keyboard(&mut self, e: KeyboardEvent) {
+        self.ctx.seen();
+        // Key diagnostics only while ~/.config/rdesk/keylog exists: it records
+        // everything typed, passwords included, so it is never on by default.
+        if std::path::Path::new(&std::env::var("HOME").unwrap_or_default()).join(".config/rdesk/keylog").exists() {
+            info!(?e, "key");
+        }
         match e {
             KeyboardEvent::Pressed { code, extended } => self.key(code, extended, true),
             KeyboardEvent::Released { code, extended } => self.key(code, extended, false),
@@ -393,6 +575,7 @@ impl RdpServerInputHandler for Input {
         }
     }
     fn mouse(&mut self, e: MouseEvent) {
+        self.ctx.seen();
         use MouseEvent::*;
         match e {
             Move { x, y } => {
@@ -404,7 +587,8 @@ impl RdpServerInputHandler for Input {
                     let dy = if y < M { -S } else if y + M > f.fh { S } else { 0 };
                     if dx != 0 || dy != 0 { self.ctx.pan_to(vx as i32 + dx, vy as i32 + dy); }
                 }
-                let (sx, sy) = self.ctx.fit().to_screen(x, y, self.ctx.w, self.ctx.h);
+                let (w, h) = self.ctx.dimensions();
+                let (sx, sy) = self.ctx.fit_for(w, h).to_screen(x, y, w, h);
                 self.fake(xproto::MOTION_NOTIFY_EVENT, 0, sx, sy)
             }
             LeftPressed => self.button(1, true), LeftReleased => self.button(1, false),
@@ -433,32 +617,72 @@ struct Updates {
     ctx: Arc<Ctx>,
     started: Instant,
     next: tokio::time::Instant,
+    /// XFIXES serial of the last pointer shape sent to the client.
+    cursor_serial: Option<u32>,
 }
 
 const LEGACY_FPS: u32 = 15;
+/// How often the pointer shape is polled (it goes out only when it changes).
+const CURSOR_POLL: Duration = Duration::from_millis(16);
+/// Largest pointer without the large-pointer capability (MS-RDPBCGR 2.2.9.1.1.4.4).
+const MAX_POINTER: usize = 96;
+
+/// X cursor (premultiplied ARGB, top-down) as an RDP 32 bpp pointer: straight
+/// alpha BGRA, bottom-up rows, cropped to 96x96 around the hotspot's corner.
+fn rdp_pointer(cur: &x11rb::protocol::xfixes::GetCursorImageReply) -> RGBAPointer {
+    let (cw, ch) = (cur.width as usize, cur.height as usize);
+    let (w, h) = (cw.clamp(1, MAX_POINTER), ch.clamp(1, MAX_POINTER));
+    let mut data = Vec::with_capacity(w * h * 4);
+    for y in (0..h).rev() {
+        for x in 0..w {
+            let px = if x < cw && y < ch { cur.cursor_image[y * cw + x] } else { 0 };
+            let a = px >> 24;
+            let un = |c: u32| if a == 0 { 0 } else { ((c * 255 + a / 2) / a).min(255) as u8 };
+            data.extend_from_slice(&[un(px & 0xff), un((px >> 8) & 0xff), un((px >> 16) & 0xff), a as u8]);
+        }
+    }
+    RGBAPointer {
+        cache_index: 0,
+        width: w as u16,
+        height: h as u16,
+        hot_x: cur.xhot.min(w as u16 - 1),
+        hot_y: cur.yhot.min(h as u16 - 1),
+        data,
+    }
+}
 
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for Updates {
     async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>> {
         loop {
+            if self.ctx.client_cursor {
+                let cur = self.ctx.conn.xfixes_get_cursor_image().ok().and_then(|c| c.reply().ok());
+                if let Some(cur) = cur.filter(|c| Some(c.cursor_serial) != self.cursor_serial) {
+                    self.cursor_serial = Some(cur.cursor_serial);
+                    return Ok(Some(DisplayUpdate::RGBAPointer(rdp_pointer(&cur))));
+                }
+            }
             let mode = *self.ctx.mode.lock().unwrap();
-            match mode {
+            let wait = match mode {
                 // GFX path owns the screen; keep polling in case it collapses into Legacy.
-                Mode::Avc => tokio::time::sleep(Duration::from_millis(100)).await,
-                Mode::Legacy => break,
+                Mode::Avc => CURSOR_POLL,
+                Mode::Legacy => {
+                    let now = tokio::time::Instant::now();
+                    if now >= self.next { break }
+                    (self.next - now).min(CURSOR_POLL)
+                }
                 Mode::Unknown if self.started.elapsed() > Duration::from_secs(3) => {
                     info!("no GFX channel from client, using legacy bitmap updates");
                     *self.ctx.mode.lock().unwrap() = Mode::Legacy;
-                    break;
+                    continue;
                 }
-                Mode::Unknown => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
+                Mode::Unknown => CURSOR_POLL,
+            };
+            tokio::time::sleep(if self.ctx.client_cursor { wait } else { wait.max(Duration::from_millis(50)) }).await;
         }
-        tokio::time::sleep_until(self.next).await;
         self.next = tokio::time::Instant::now() + Duration::from_secs_f64(1.0 / LEGACY_FPS as f64);
         let ctx = self.ctx.clone();
-        let fit = self.ctx.fit();
-        let data = tokio::task::spawn_blocking(move || grab(&ctx).map(|()| fit.bitmap(ctx.shm.buf(), ctx.w, ctx.h))).await??;
+        let (fit, data) = tokio::task::spawn_blocking(move || bitmap(&ctx)).await??;
         Ok(Some(DisplayUpdate::Bitmap(ironrdp_server::BitmapUpdate {
             x: 0,
             y: 0,
@@ -471,13 +695,41 @@ impl RdpServerDisplayUpdates for Updates {
     }
 }
 
-/// Screen + cursor into the shm buffer.
-fn grab(ctx: &Ctx) -> anyhow::Result<()> {
-    ctx.conn.shm_get_image(ctx.root, 0, 0, ctx.w, ctx.h, !0, ImageFormat::Z_PIXMAP.into(), ctx.shm.seg, 0)?.reply()?;
-    if let Some(cur) = ctx.conn.xfixes_get_cursor_image().ok().and_then(|c| c.reply().ok()) {
-        draw_cursor(ctx.shm.buf(), ctx.w as usize, ctx.h as usize, &cur);
+struct Capture {
+    w: u16,
+    h: u16,
+    shm: Shm,
+}
+
+/// Query live geometry, including the greeter -> Cinnamon mode change. Keep
+/// the SHM buffer locked until its consumer has copied/written the frame.
+fn grab<'a>(ctx: &'a Ctx) -> anyhow::Result<std::sync::MutexGuard<'a, Capture>> {
+    let mut c = ctx.capture.lock().unwrap();
+    let geo = ctx.conn.get_geometry(ctx.root)?.reply()?;
+    let (w, h) = (geo.width & !1, geo.height & !1);
+    anyhow::ensure!(w >= 2 && h >= 2, "empty X screen");
+    if (c.w, c.h) != (w, h) {
+        info!("X screen changed: {}x{} -> {}x{}", c.w, c.h, w, h);
+        // Detach before dropping the old mapping; Shm is also used by the
+        // older binaries, so lifecycle changes remain local here.
+        let shm = Shm::new(&ctx.conn, w as usize * h as usize * 4);
+        ctx.conn.shm_detach(c.shm.seg)?.check()?;
+        unsafe { libc::shmdt(c.shm.ptr as *const libc::c_void); }
+        *c = Capture { w, h, shm };
     }
-    Ok(())
+    ctx.conn.shm_get_image(ctx.root, 0, 0, c.w, c.h, !0, ImageFormat::Z_PIXMAP.into(), c.shm.seg, 0)?.reply()?;
+    if !ctx.client_cursor {
+        if let Some(cur) = ctx.conn.xfixes_get_cursor_image().ok().and_then(|c| c.reply().ok()) {
+            draw_cursor(c.shm.buf(), c.w as usize, c.h as usize, &cur);
+        }
+    }
+    Ok(c)
+}
+
+fn bitmap(ctx: &Ctx) -> anyhow::Result<(Fit, Vec<u8>)> {
+    let c = grab(ctx)?;
+    let fit = ctx.fit_for(c.w, c.h);
+    Ok((fit, fit.bitmap(c.shm.buf(), c.w, c.h)))
 }
 
 #[async_trait::async_trait]
@@ -489,24 +741,46 @@ impl RdpServerDisplay for Display {
     /// Adopt the client's desktop size (with_honor_client_desktop_size); the
     /// screen is scaled into it, see `Fit`.
     async fn request_initial_size(&mut self, client: DesktopSize) -> DesktopSize {
-        let (w, h) = (client.width & !1, client.height & !1);
+        let (w, h) = ((client.width & !1).max(2), (client.height & !1).max(2));
+        // After a greeter login the desktop takes the client's size when the
+        // monitor has that mode (else the largest that fits). Phones keep the
+        // monitor's own mode; they get the window/portrait handling below.
+        if self.ctx.fresh_login.swap(false, Ordering::Relaxed) && !portrait::phone_size(w, h) {
+            let ctx = self.ctx.clone();
+            let r = tokio::task::spawn_blocking(move || session::settle_mode(&ctx.conn, ctx.root, w, h)).await;
+            if let Ok(Err(e)) = r { warn!("cold-boot mode for {}x{}: {:#}", w, h, e); }
+        }
+        if self.ctx.phone_res && portrait::phone_size(w, h) {
+            let mut saved = self.ctx.phone_desktop.lock().unwrap();
+            // Initial size can be requested again during RDP reactivation.
+            // Keep the original restore point for this entire connection.
+            if saved.is_none() {
+                match portrait::PhoneDesktop::start(self.ctx.conn.clone(), self.ctx.root, w, h) {
+                    Ok(desktop) => *saved = desktop,
+                    Err(e) => warn!("portrait desktop unavailable, retaining scaled view: {:#}", e),
+                }
+            }
+        }
+        // Authentication may have started Cinnamon and changed the X mode.
+        if let Err(e) = grab(&self.ctx) { warn!("initial capture: {:#}", e); }
+        let (screen_w, screen_h) = self.ctx.dimensions();
         *self.ctx.out.lock().unwrap() = (w, h);
         let fit = self.ctx.fit();
         if let Some(_) = fit.win {
             // Start with the window centred on the pointer.
             let p = self.ctx.conn.query_pointer(self.ctx.root).ok().and_then(|c| c.reply().ok());
-            let (px, py) = p.map(|p| (p.root_x as i32, p.root_y as i32)).unwrap_or((self.ctx.w as i32 / 2, self.ctx.h as i32 / 2));
+            let (px, py) = p.map(|p| (p.root_x as i32, p.root_y as i32)).unwrap_or((screen_w as i32 / 2, screen_h as i32 / 2));
             self.ctx.pan_to(px - fit.fw as i32 / 2, py - fit.fh as i32 / 2);
             let (vx, vy) = *self.ctx.view.lock().unwrap();
-            info!("client desktop {}x{}, screen {}x{} shown as a {}x{} window at {},{}", w, h, self.ctx.w, self.ctx.h, fit.fw, fit.fh, vx, vy);
+            info!("client desktop {}x{}, screen {}x{} shown as a {}x{} window at {},{}", w, h, screen_w, screen_h, fit.fw, fit.fh, vx, vy);
         } else {
-            info!("client desktop {}x{}, screen {}x{} shown as {}x{} at {},{}", w, h, self.ctx.w, self.ctx.h, fit.fw, fit.fh, fit.fx, fit.fy);
+            info!("client desktop {}x{}, screen {}x{} shown as {}x{} at {},{}", w, h, screen_w, screen_h, fit.fw, fit.fh, fit.fx, fit.fy);
         }
         DesktopSize { width: w, height: h }
     }
     async fn updates(&mut self) -> anyhow::Result<Box<dyn RdpServerDisplayUpdates>> {
         *self.ctx.mode.lock().unwrap() = Mode::Unknown;
-        Ok(Box::new(Updates { ctx: self.ctx.clone(), started: Instant::now(), next: tokio::time::Instant::now() }))
+        Ok(Box::new(Updates { ctx: self.ctx.clone(), started: Instant::now(), next: tokio::time::Instant::now(), cursor_serial: None }))
     }
 }
 
@@ -595,6 +869,7 @@ impl GraphicsPipelineHandler for Gfx {
         // 0xFFFFFFFF = SUSPEND_FRAME_ACKNOWLEDGEMENT: no more acks are coming.
         if queue_depth == u32::MAX { self.ctx.acked_suspended.store(true, Ordering::Relaxed); }
         self.ctx.acked.store(frame_id, Ordering::Relaxed);
+        self.ctx.seen();
     }
     fn on_qoe_metrics(&mut self, m: ironrdp_egfx::server::QoeMetrics) {
         tracing::debug!(?m, "qoe");
@@ -606,9 +881,10 @@ impl GraphicsPipelineHandler for Gfx {
         self.stop.store(true, Ordering::Relaxed);
         self.stop = Arc::new(AtomicBool::new(false));
         let (ctx, ev, stop) = (self.ctx.clone(), self.ev.clone(), self.stop.clone());
-        thread::spawn(move || {
+        let task = thread::spawn(move || {
             if let Err(e) = stream(ctx, ev, handle, stop) { error!("stream: {:#}", e); }
         });
+        self.ctx.streams.lock().unwrap().push((self.stop.clone(), task));
     }
     fn on_close(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -642,7 +918,7 @@ fn flush(g: &mut GraphicsPipelineServer, ev: &EvSender) -> anyhow::Result<()> {
 
 /// Per-connection pipeline: capture -> ffmpeg (AVI-framed H.264) -> AVC420 frames.
 fn stream(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
-    let (w, h) = (ctx.w, ctx.h);
+    let (w, h) = ctx.dimensions();
     let fit = ctx.fit();
     let (sw, sh) = (fit.ow, fit.oh);
     let (surface, avc) = {
@@ -687,37 +963,68 @@ fn stream(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<Atomic
     info!(surface, "streaming {}x{} as {}x{}", w, h, sw, sh);
 
 
+    // The RDP surface stays fixed. Restart only ffmpeg when X changes size;
+    // the next encoder emits new SPS/PPS and an IDR on the same surface.
+    let started = Instant::now();
+    loop {
+        if stop.load(Ordering::Relaxed) { return Ok(()); }
+        match stream_avc(&ctx, &ev, &handle, &stop, surface, started) {
+            Ok(false) => return Ok(()),
+            Ok(true) => info!("restarting encoder for new X geometry"),
+            // An NVIDIA driver update leaves the loaded kernel module and the new
+            // libraries mismatched until reboot: NVENC fails, the client stays black.
+            Err(e) if ctx.nvenc.load(Ordering::Relaxed) && !probe_nvenc() => {
+                warn!("NVENC unavailable ({:#}); encoding with libx264 until restart (reboot after a driver update)", e);
+                ctx.nvenc.store(false, Ordering::Relaxed);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn stream_avc(ctx: &Arc<Ctx>, ev: &EvSender, handle: &GfxServerHandle, stop: &Arc<AtomicBool>, surface: u16, t0: Instant) -> anyhow::Result<bool> {
+    let (w, h) = ctx.dimensions();
+    let fit = ctx.fit_for(w, h);
+    let (sw, sh) = (fit.ow, fit.oh);
+    let resized = Arc::new(AtomicBool::new(false));
+    let cap_stop = Arc::new(AtomicBool::new(false));
     let win = fit.win.is_some();
     let (ew, eh) = if win { (sw, sh) } else { (w, h) };
-    let mut enc = spawn_encoder(ew, eh, ctx.fps, &ctx.bitrate, ctx.nvenc, "avi", fit.vf().as_deref());
+    let mut enc = spawn_encoder(ew, eh, ctx.fps, &ctx.bitrate, ctx.nvenc.load(Ordering::Relaxed), "avi", fit.vf().as_deref());
     let mut enc_in = enc.stdin.take().unwrap();
     let mut enc_out = enc.stdout.take().unwrap();
 
     // Capture thread. Skips ticks while the client has too many frames un-acked,
     // so a slow link just lowers the frame rate instead of building a queue.
     let cap = {
-        let (ctx, handle, stop) = (ctx.clone(), handle.clone(), stop.clone());
+        let (ctx, handle, stop, resized, cap_stop) = (ctx.clone(), handle.clone(), stop.clone(), resized.clone(), cap_stop.clone());
         let period = Duration::from_secs_f64(1.0 / ctx.fps as f64);
         thread::spawn(move || {
             let mut next = Instant::now();
-            while !stop.load(Ordering::Relaxed) {
+            while !stop.load(Ordering::Relaxed) && !cap_stop.load(Ordering::Relaxed) {
                 next += period;
                 let busy = handle.lock().unwrap().should_backpressure();
                 if !busy {
-                    if grab(&ctx).is_err() { break; }
+                    let c = match grab(&ctx) {
+                        Ok(c) => c,
+                        Err(e) => { warn!("capture: {:#}", e); thread::sleep(period); continue; }
+                    };
+                    if (c.w, c.h) != (w, h) {
+                        resized.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     // Window mode: crop per frame, the window moves while panning.
-                    let r = if win { enc_in.write_all(&ctx.fit().bitmap(ctx.shm.buf(), w, h)) } else { enc_in.write_all(ctx.shm.buf()) };
+                    let r = if win { enc_in.write_all(&ctx.fit_for(w, h).bitmap(c.shm.buf(), w, h)) } else { enc_in.write_all(c.shm.buf()) };
                     if r.is_err() { break; }
                 }
                 let now = Instant::now();
                 if next > now { thread::sleep(next - now); } else { next = now; }
             }
-            stop.store(true, Ordering::Relaxed);
+            // Closing stdin lets AVI drain and EOF; a resize is not a disconnect.
         })
     };
 
     // This thread: AVI chunks -> AVC420 frames.
-    let t0 = Instant::now();
     // ironrdp-egfx 0.3 takes these bounds as inclusive and derives the
     // WireToSurface destRect as right+1/bottom+1; with right=sw the dest rect
     // overshoots the surface by a pixel and mstsc resets the pipeline
@@ -733,6 +1040,7 @@ fn stream(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<Atomic
             let Some(frame) = avi.next_frame()? else { break };
             let ms = t0.elapsed().as_millis() as u32;
             loop {
+                if stop.load(Ordering::Relaxed) { return Ok(()); }
                 let mut g = handle.lock().unwrap();
                 if !g.is_ready() { anyhow::bail!("gfx channel closed"); }
                 if g.should_backpressure() { drop(g); thread::sleep(Duration::from_millis(1)); continue; }
@@ -748,12 +1056,16 @@ fn stream(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<Atomic
         }
         Ok(())
     })();
-    stop.store(true, Ordering::Relaxed);
+    cap_stop.store(true, Ordering::Relaxed);
     enc.kill().ok();
     enc.wait().ok();
     cap.join().ok();
-    info!("stream ended");
-    r
+    let changed = resized.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed);
+    // A resize before the first captured frame can give ffmpeg an empty
+    // input (no AVI header). It still needs a fresh encoder, not a disconnect.
+    if changed { return Ok(true); }
+    r?;
+    Ok(false)
 }
 
 /// A GFX PDU encoded and wrapped in a ZGFX segment, ready for the DVC. Every
@@ -784,7 +1096,6 @@ fn zgfx(pdu: GfxPdu) -> ironrdp_dvc::DvcMessage {
 /// frames in flight so the client's decode speed sets the pace.
 fn stream_planar(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc<AtomicBool>, surface: u16) -> anyhow::Result<()> {
     const T: usize = 64;
-    let (w, h) = (ctx.w, ctx.h);
     let period = Duration::from_secs_f64(1.0 / ctx.fps as f64);
     let t0 = Instant::now();
     let mut prev: Option<(Vec<u8>, u16, u16)> = None;
@@ -809,9 +1120,10 @@ fn stream_planar(ctx: Arc<Ctx>, ev: EvSender, handle: GfxServerHandle, stop: Arc
             if ctx.acked_suspended.load(Ordering::Relaxed) || unacked < inflight { break; }
             thread::sleep(Duration::from_millis(1));
         }
-        grab(&ctx)?;
-        let fit = ctx.fit();
-        let cur = fit.bitmap(ctx.shm.buf(), w, h);
+        let (fit, cur) = match bitmap(&ctx) {
+            Ok(frame) => frame,
+            Err(e) => { warn!("capture: {:#}", e); thread::sleep(period); continue; }
+        };
         let (ow, oh) = (fit.ow as usize, fit.oh as usize);
         // Dirty spans: runs of changed 64x64 tiles per tile row (whole frame the first time
         // or when the client size changed).
@@ -972,14 +1284,24 @@ async fn main() -> anyhow::Result<()> {
     let conn = Arc::new(conn);
     let screen = &conn.setup().roots[screen_num];
     let root = screen.root;
-    // AVC420 wants 16-aligned dimensions.
-    let (w, h) = (screen.width_in_pixels & !15, screen.height_in_pixels & !15);
+    // H.264 describes non-macroblock dimensions through SPS cropping. Keep all
+    // 1080 rows; truncating to 1072 makes native 1080p subtly scaled/letterboxed.
+    let (w, h) = (screen.width_in_pixels & !1, screen.height_in_pixels & !1);
     conn.shm_query_version()?.reply().context("MIT-SHM missing")?;
     conn.xfixes_query_version(5, 0)?.reply().context("XFIXES missing")?;
-    let shm = Arc::new(Shm::new(&conn, w as usize * h as usize * 4));
+    let shm = Shm::new(&conn, w as usize * h as usize * 4);
     let nvenc = !o.cpu && probe_nvenc();
-    let ctx = Arc::new(Ctx { conn, root, w, h, shm, fps: o.fps, bitrate: o.bitrate.clone(), nvenc, mode: Mutex::new(Mode::Unknown), out: Mutex::new((w, h)),
-                             viewport: o.viewport, view: Mutex::new((0, 0)), acked: AtomicU32::new(u32::MAX), acked_suspended: AtomicBool::new(false) });
+    let ctx = Arc::new(Ctx { conn, root, capture: Mutex::new(Capture { w, h, shm }), fps: o.fps, bitrate: o.bitrate.clone(), nvenc: AtomicBool::new(nvenc), mode: Mutex::new(Mode::Unknown), out: Mutex::new((w, h)),
+                             viewport: o.viewport, view: Mutex::new((0, 0)), acked: AtomicU32::new(u32::MAX), acked_suspended: AtomicBool::new(false),
+                             phone_res: o.phone_res, phone_desktop: Mutex::new(None),
+                             activity: Mutex::new(Activity::Handshake),
+                             client_cursor: std::env::var("RDESK_CURSOR").map_or(true, |v| v != "video"), streams: Mutex::new(Vec::new()), fresh_login: AtomicBool::new(false) });
+
+    // Clipboard needs its own X connection, opened while the cookie is readable.
+    let clip = match clip::ClipFactory::start(None) {
+        Ok(c) => Some(c),
+        Err(e) => { warn!("clipboard unavailable: {:#}", e); None }
+    };
 
     // Started as root (system service) only to read LightDM's X cookie: the X
     // connection and its shm are set up now, so become the login user before
@@ -1003,32 +1325,46 @@ async fn main() -> anyhow::Result<()> {
 
     let ev: EvSender = Default::default();
     let addr: std::net::SocketAddr = o.bind.parse().context("--bind")?;
-    // Two login modes:
+    // Three login modes:
+    //  - nthash: NLA (CredSSP/NTLM) against the stored NT hash of the Linux password;
+    //    mstsc prompts like it does for Windows. After NTLM succeeds the client
+    //    delegates the plain password (patched ironrdp-acceptor), which goes through
+    //    the same validator as TLS below: unix_chkpwd or the cold-boot LightDM login.
     //  - system password: TLS without NLA, like xrdp. mstsc only forwards a password
     //    it has *saved* ("Allow me to save credentials"); it never sends a typed one
     //    to a non-NLA server. We check it with unix_chkpwd.
-    //  - --pass: NLA (CredSSP/NTLM) with a fixed password. NTLM needs the password on
-    //    the server, which is why the system password cannot be used here.
+    //  - --pass: NLA with a fixed password; NTLM is the whole check.
+    let nla_secret = if !o.pass.is_empty() {
+        Some(o.pass.clone())
+    } else {
+        o.nthash.as_ref().map(|h| format!("$NTLM$:{}", h))
+    };
     let builder = RdpServer::builder().with_addr(addr);
-    let builder = if o.pass.is_empty() {
+    let builder = if nla_secret.is_none() {
         builder.with_tls(acceptor)
     } else {
         builder.with_hybrid(acceptor, identity.pub_key.clone())
     };
+    let validator: Option<Arc<dyn CredentialValidator>> = if o.pass.is_empty() {
+        Some(Arc::new(Login { user: o.user.clone(), cold_boot: o.cold_boot, hash_file: o.certdir.join("nthash"), ctx: ctx.clone() }))
+    } else {
+        None
+    };
     let mut server = builder
-        .with_input_handler(Input { ctx: ctx.clone(), keysyms: None, spare: None })
+        .with_input_handler(Input { ctx: ctx.clone(), keysyms: None, spare: None, ctrl: false, remapped: HashMap::new() })
         .with_display_handler(Display { ctx: ctx.clone() })
         .with_gfx_factory(Some(Box::new(GfxFactory { ctx: ctx.clone(), ev })))
+        .with_cliprdr_factory(clip.map(|c| Box::new(c) as Box<dyn ironrdp_server::CliprdrServerFactory>))
         .with_honor_client_desktop_size(true)
-        .with_credential_validator(Some(Arc::new(Login { user: o.user.clone() })))
+        .with_credential_validator(validator)
         .build();
-    if !o.pass.is_empty() {
-        server.set_credentials(Some(Credentials { username: o.user.clone(), password: o.pass.clone(), domain: None }));
+    if let Some(password) = nla_secret {
+        server.set_credentials(Some(Credentials { username: o.user.clone(), password, domain: None }));
     }
 
     info!("rdesk-rdp: {}x{}{} @{}fps {} encoder={} login={} ({}) listening on {}",
           w, h, if o.viewport { " (window for every smaller client)" } else { "" }, o.fps, o.bitrate, if nvenc { "h264_nvenc" } else { "libx264" }, o.user,
-          if o.pass.is_empty() { "TLS, system password from saved mstsc credentials" } else { "NLA, --pass" }, o.bind);
+          if !o.pass.is_empty() { "NLA, --pass" } else if o.nthash.is_some() { "NLA, system password" } else { "TLS, system password from saved mstsc credentials" }, o.bind);
     // Own accept loop instead of server.run(): IronRDP serves one client at a
     // time, so a peer that vanishes mid-handshake (NAT dropping the flow) would
     // otherwise hold the loop for the kernel's ~15 min of retransmits while new
@@ -1059,13 +1395,165 @@ async fn main() -> anyhow::Result<()> {
     }
     listener.set_nonblocking(true)?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
-    loop {
-        let (stream, peer) = listener.accept().await?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let shutdown = async { tokio::select! { _ = terminate.recv() => {}, _ = interrupt.recv() => {} } };
+    tokio::pin!(shutdown);
+    // The login mode is fixed per server; when the PAM hook or a login stores a
+    // new NT hash, exit between connections and let systemd start one with it.
+    let hash_file = o.certdir.join("nthash");
+    let mut hash_check = tokio::time::interval(Duration::from_secs(5));
+    let mut next: Option<(tokio::net::TcpStream, std::net::SocketAddr)> = None;
+    'serve: loop {
+        let (stream, peer) = match next.take() {
+            Some(c) => c,
+            None => tokio::select! {
+                accepted = listener.accept() => accepted?,
+                _ = &mut shutdown => break,
+                _ = hash_check.tick(), if o.pass.is_empty() => {
+                    if nthash::read(&hash_file) != o.nthash {
+                        info!("{} changed, restarting to use it", hash_file.display());
+                        std::process::exit(0);
+                    }
+                    continue;
+                }
+            },
+        };
+        keepalive(&stream);
         info!(%peer, "connection");
+        ctx.set_activity(Activity::Handshake);
         let t = Instant::now();
-        match server.run_connection(stream).await {
-            Ok(()) => info!(%peer, "disconnected after {:.0?}", t.elapsed()),
-            Err(e) => error!(%peer, "connection failed after {:.0?}: {:#}", t.elapsed(), e),
+        // IronRDP serves one client at a time. Keep accepting meanwhile: a new
+        // client replaces one that is still handshaking (mstsc abandons its
+        // pre-prompt connection) or has gone silent (laptop asleep, NAT dropped
+        // the flow); otherwise it is turned away instead of queueing behind it.
+        let result = {
+            let conn = server.run_connection(stream);
+            tokio::pin!(conn);
+            loop {
+                tokio::select! {
+                    result = &mut conn => break Some(result),
+                    _ = &mut shutdown => break None,
+                    accepted = listener.accept() => {
+                        let (s2, p2) = accepted?;
+                        if ctx.replaceable() {
+                            info!(%peer, new = %p2, "replacing idle or unfinished connection");
+                            next = Some((s2, p2));
+                            break Some(Ok(()));
+                        }
+                        warn!(%peer, rejected = %p2, "busy with a live session, refusing new connection");
+                    }
+                }
+            }
+        };
+        ctx.end_connection();
+        ctx.set_activity(Activity::Handshake);
+        match result {
+            Some(Ok(())) if next.is_some() => info!(%peer, "dropped after {:.0?}", t.elapsed()),
+            Some(Ok(())) => info!(%peer, "disconnected after {:.0?}", t.elapsed()),
+            Some(Err(e)) => error!(%peer, "connection failed after {:.0?}: {:#}", t.elapsed(), e),
+            None => break 'serve,
         }
+    }
+    info!("server stopped");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pointer_is_bottom_up_straight_alpha_bgra() {
+        let cur = x11rb::protocol::xfixes::GetCursorImageReply {
+            sequence: 0, length: 0, x: 0, y: 0, width: 1, height: 2, xhot: 3, yhot: 0, cursor_serial: 1,
+            // top: half-transparent premultiplied red; bottom: opaque blue
+            cursor_image: vec![0x8080_0000, 0xff00_00ff],
+        };
+        let p = rdp_pointer(&cur);
+        assert_eq!((p.width, p.height, p.hot_x, p.hot_y), (1, 2, 0, 0));
+        assert_eq!(p.data, vec![0xff, 0, 0, 0xff, 0, 0, 0xff, 0x80]);
+    }
+
+    #[test]
+    fn nt_hash_matches_ntlm() {
+        // MS-NLMP test vector: NTOWFv1("Password").
+        assert_eq!(nthash::hash("Password"), "a4f49c406510bdcab6824ee7c30fd852");
+    }
+
+    #[test]
+    fn native_1080p_keeps_every_row_and_pixel() {
+        let fit = Fit::new(1920, 1080, 1920, 1080);
+        assert!(fit.identity());
+        assert_eq!((fit.fw, fit.fh, fit.fx, fit.fy), (1920, 1080, 0, 0));
+        assert!(fit.vf().is_none());
+        assert_eq!(fit.to_screen(1919, 1079, 1920, 1080), (1919, 1079));
+    }
+
+    #[test]
+    fn native_portrait_pixels_and_pointer_have_identical_coordinates() {
+        let (w, h) = (992u16, 1850u16);
+        let fit = Fit::new(w, h, w, h);
+        assert!(fit.identity());
+        assert!(fit.vf().is_none());
+        for (x, y) in [(0, 0), (496, 925), (991, 1849)] {
+            assert_eq!(fit.to_screen(x, y, w, h), (x as i16, y as i16));
+        }
+        let mut pixels = vec![0; w as usize * h as usize * 4];
+        let i = (1600 * w as usize + 800) * 4;
+        pixels[i..i + 4].copy_from_slice(&[11, 22, 33, 255]);
+        assert_eq!(fit.bitmap(&pixels, w, h), pixels);
+    }
+
+    #[test]
+    fn same_aspect_ratio_still_scales_pixels_and_input() {
+        let fit = Fit::new(1280, 720, 1920, 1080);
+        assert!(!fit.identity());
+        assert!(fit.vf().unwrap().starts_with("scale=1920:1080:"));
+        assert_eq!(fit.to_screen(1919, 1079, 1280, 720), (1279, 719));
+        let src = vec![7; 1280 * 720 * 4];
+        let frame = fit.bitmap(&src, 1280, 720);
+        assert_eq!(frame.len(), 1920 * 1080 * 4);
+        assert!(frame.iter().all(|b| *b == 7));
+    }
+
+    #[test]
+    fn ultrawide_letterbox_and_pointer_remain_consistent() {
+        let fit = Fit::new(3440, 1440, 1920, 1080);
+        assert_eq!((fit.fw, fit.fh, fit.fx, fit.fy), (1920, 802, 0, 138));
+        assert_eq!(fit.to_screen(0, 0, 3440, 1440), (0, 0));
+        assert_eq!(fit.to_screen(960, 539, 3440, 1440), (1720, 720));
+    }
+
+    #[test]
+    #[ignore = "requires a disposable Xephyr display in RDESK_TEST_DISPLAY"]
+    fn live_capture_tracks_resize() -> anyhow::Result<()> {
+        let display = std::env::var("RDESK_TEST_DISPLAY")?;
+        anyhow::ensure!(display != ":0" && display != ":0.0", "use a disposable X server");
+        let (conn, sn) = x11rb::connect(Some(&display))?;
+        let conn = Arc::new(conn);
+        let s = &conn.setup().roots[sn];
+        let (root, w, h) = (s.root, s.width_in_pixels, s.height_in_pixels);
+        conn.shm_query_version()?.reply()?;
+        conn.xfixes_query_version(5, 0)?.reply()?;
+        let capture = Mutex::new(Capture { w, h, shm: Shm::new(&conn, w as usize * h as usize * 4) });
+        let ctx = Ctx { conn, root, capture, fps: 30, bitrate: "12M".into(), nvenc: AtomicBool::new(false),
+            mode: Mutex::new(Mode::Unknown), out: Mutex::new((1920, 1080)), viewport: false,
+            view: Mutex::new((0, 0)), acked: AtomicU32::new(u32::MAX), acked_suspended: AtomicBool::new(false),
+            phone_res: false, phone_desktop: Mutex::new(None), client_cursor: false, activity: Mutex::new(Activity::Handshake), streams: Mutex::new(Vec::new()), fresh_login: AtomicBool::new(false) };
+        for _ in 0..3 {
+            let status = Command::new("xrandr").args(["--display", &display, "--output", "default", "--mode", "1280x960"]).status()?;
+            anyhow::ensure!(status.success(), "nested xrandr resize failed");
+            let (fit, pixels) = bitmap(&ctx)?;
+            assert_eq!(ctx.dimensions(), (1280, 960));
+            assert!(!fit.identity());
+            assert_eq!(pixels.len(), 1920 * 1080 * 4);
+            session::set_1080p(&ctx.conn, root)?;
+            let (fit, pixels) = bitmap(&ctx)?;
+            assert_eq!(ctx.dimensions(), (1920, 1080));
+            assert!(fit.identity());
+            assert_eq!(pixels.len(), 1920 * 1080 * 4);
+        }
+        Ok(())
     }
 }

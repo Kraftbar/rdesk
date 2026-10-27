@@ -1,0 +1,1 @@
+d /run/rdesk-login 0755 lightdm lightdm -

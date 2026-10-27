@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=Slick Greeter with rdesk login
+Comment=Normal local login with authenticated remote session startup
+Exec=/usr/local/libexec/rdesk-greeter --user nybo -- /usr/sbin/slick-greeter
+Type=Application

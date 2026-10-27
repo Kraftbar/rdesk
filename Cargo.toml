@@ -17,23 +17,36 @@ path = "client.rs"
 name = "rdesk-rdp"
 path = "rdp.rs"
 
+# pam_exec hook that keeps ~/.config/rdesk/nthash current (see nthash.rs).
+[[bin]]
+name = "rdesk-nthash"
+path = "pam_nthash.rs"
+
 [dependencies]
-x11rb = { version = "0.14", features = ["shm", "xtest", "xfixes"] }
+x11rb = { version = "0.14", features = ["shm", "xtest", "xfixes", "randr"] }
 libc = "0.2"
 snow = "0.9"
 sha2 = "0.10"
 minifb = { version = "0.28", default-features = false, features = ["x11", "dlopen"] }
 ironrdp-server = { version = "0.13", features = ["egfx", "helper", "nscodec"] }
 ironrdp-egfx = "0.3"
+ironrdp-cliprdr = "0.7"
+ironrdp-core = "0.2"
 ironrdp-dvc = "0.8"
 ironrdp-pdu = "0.9"
 ironrdp-graphics = "0.9"
 ironrdp-svc = "0.8"
-tokio = { version = "1", features = ["rt", "macros", "sync", "net", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "net", "time", "signal"] }
+md4 = "0.10"
 async-trait = "0.1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Patched: pass the password mstsc delegates over CredSSP to the credential
+# validator, so NLA can check the Linux password (see rdp.rs, nthash).
+[patch.crates-io]
+ironrdp-acceptor = { path = "vendor/ironrdp-acceptor" }
 
 [profile.release]
 opt-level = 3
