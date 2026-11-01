@@ -2,7 +2,8 @@
  *
  * Milestone 1: TLS security, slow-path connection sequence, raw 32 bpp
  * fast-path bitmap updates of changed 64x64 tiles, fast-path input via
- * XTest, XFixes cursor shapes. One client at a time. */
+ * XTest, XFixes cursor shapes. One client at a time. DAMAGE says which
+ * tiles were drawn to; only those rows are grabbed and compared. */
 #define _GNU_SOURCE
 #include "rdp.h"
 #include "nla.h"
@@ -16,6 +17,7 @@
 #include <termios.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xfixes.h>
+#include <X11/extensions/Xdamage.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <linux/sockios.h>
@@ -89,6 +91,11 @@ static struct {
 	XShmSegmentInfo shm;
 	uint8_t *prev;   /* last frame sent, same stride as img */
 	int fixes_ev;
+	Damage damage;   /* 0: no DAMAGE, every tile is dirty every frame */
+	XserverRegion region;
+	int damage_ev, damaged;
+	uint8_t *dirty;  /* per tile, tw x th */
+	int tw, th;
 } x;
 
 static int x_open(void)
@@ -109,6 +116,12 @@ static int x_open(void)
 		return -1;
 	}
 	XFixesSelectCursorInput(x.dpy, x.root, XFixesDisplayCursorNotifyMask);
+	if (!off("damage") && XDamageQueryExtension(x.dpy, &x.damage_ev, &err)) {
+		x.damage = XDamageCreate(x.dpy, x.root, XDamageReportNonEmpty);
+		x.region = XFixesCreateRegion(x.dpy, NULL, 0);
+	} else {
+		msg("no DAMAGE: grabbing whole frames");
+	}
 	return 0;
 }
 
@@ -122,6 +135,8 @@ static void x_free_image(void)
 	x.img = NULL;
 	free(x.prev);
 	x.prev = NULL;
+	free(x.dirty);
+	x.dirty = NULL;
 }
 
 static int x_alloc_image(void)
@@ -142,6 +157,10 @@ static int x_alloc_image(void)
 	x.shm.readOnly = False;
 	XShmAttach(x.dpy, &x.shm);
 	x.prev = calloc(1, (size_t)x.img->bytes_per_line * x.h);
+	x.tw = (x.w + TILE - 1) / TILE;
+	x.th = (x.h + TILE - 1) / TILE;
+	x.dirty = malloc(x.tw * x.th);
+	memset(x.dirty, 1, x.tw * x.th);
 	XSync(x.dpy, False);
 	return 0;
 }
@@ -899,18 +918,75 @@ static void queue_tile(int tx, int ty, int w, int h)
 	fp_update(&out, FP_UPD_BITMAP, u.p, u.len);
 }
 
+/* Mark the tiles drawn to since the last call. */
+static void collect_damage(void)
+{
+	if (!x.damage) {
+		memset(x.dirty, 1, x.tw * x.th);
+		return;
+	}
+	if (!x.damaged)
+		return;
+	x.damaged = 0;
+	XDamageSubtract(x.dpy, x.damage, None, x.region);
+	int n;
+	XRectangle *r = XFixesFetchRegion(x.dpy, x.region, &n);
+	for (int i = 0; i < n; i++) {
+		int x0 = r[i].x < 0 ? 0 : r[i].x / TILE;
+		int y0 = r[i].y < 0 ? 0 : r[i].y / TILE;
+		int x1 = (r[i].x + r[i].width - 1) / TILE;
+		int y1 = (r[i].y + r[i].height - 1) / TILE;
+		if (x1 >= x.tw)
+			x1 = x.tw - 1;
+		if (y1 >= x.th)
+			y1 = x.th - 1;
+		for (int ty = y0; ty <= y1; ty++)
+			memset(x.dirty + ty * x.tw + x0, 1, x1 >= x0 ? x1 - x0 + 1 : 0);
+	}
+	if (r)
+		XFree(r);
+}
+
+/* Grab rows y..y+h into the same rows of x.img: a view into the shared
+ * segment, which Xlib sends to the server as an offset. */
+static int grab_rows(int y, int h)
+{
+	XImage band = *x.img;
+	band.height = h;
+	band.data = x.img->data + (size_t)y * x.img->bytes_per_line;
+	return !XShmGetImage(x.dpy, x.root, &band, 0, y, AllPlanes);
+}
+
 static int send_frame(client *cl)
 {
 	int sz;
 	if (ioctl(cl->c.fd, SIOCOUTQ, &sz) == 0 && sz > OUTQ_MAX)
 		return 0; /* link is behind: drop this frame */
-	if (!XShmGetImage(x.dpy, x.root, x.img, 0, 0, AllPlanes))
-		return -1;
+	collect_damage();
+	if (cl->full)
+		memset(x.dirty, 1, x.tw * x.th);
+	for (int r = 0; r < x.th;) {
+		if (!memchr(x.dirty + r * x.tw, 1, x.tw)) {
+			r++;
+			continue;
+		}
+		int r1 = r + 1;
+		while (r1 < x.th && memchr(x.dirty + r1 * x.tw, 1, x.tw))
+			r1++;
+		int y1 = r1 * TILE > x.h ? x.h : r1 * TILE;
+		if (grab_rows(r * TILE, y1 - r * TILE))
+			return -1;
+		r = r1;
+	}
 	int stride = x.img->bytes_per_line, tiles = 0;
 	for (int ty = 0; ty < x.h; ty += TILE) {
 		int h = ty + TILE > x.h ? x.h - ty : TILE;
 		for (int tx = 0; tx < x.w; tx += TILE) {
 			int w = tx + TILE > x.w ? x.w - tx : TILE;
+			uint8_t *d = x.dirty + ty / TILE * x.tw + tx / TILE;
+			if (!*d)
+				continue;
+			*d = 0;
 			int changed = cl->full;
 			for (int r = 0; r < h && !changed; r++) {
 				size_t o = (size_t)(ty + r) * stride + tx * 4;
@@ -1185,6 +1261,8 @@ static void serve(int fd, SSL_CTX *ctx)
 				continue;
 			if (ev.type == x.fixes_ev + XFixesCursorNotify)
 				cl.cursor_dirty = 1;
+			else if (x.damage && ev.type == x.damage_ev + XDamageNotify)
+				x.damaged = 1;
 		}
 		int64_t t = now_ms();
 		if (active && t >= next) {
