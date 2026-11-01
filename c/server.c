@@ -20,6 +20,7 @@
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xfixes.h>
 #include <X11/extensions/Xdamage.h>
+#include <X11/extensions/Xrandr.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -65,7 +66,7 @@ static struct {
 	int no_nla;
 } opt = {"0.0.0.0", 3390, 30, NULL, "", 0};
 
-static char nthash_path[600], phone_state[600], phone_auth[600];
+static char nthash_path[600], phone_state[600], phone_auth[600], screen_restore[600];
 
 /* RDESK_OFF=clip,cursor,frames: switch parts off (diagnostics). */
 static int off(const char *what)
@@ -231,6 +232,16 @@ static Display *x_connect(const char *name)
 	return d;
 }
 
+/* Windows vanish between being seen and being asked about (more so while
+ * the screen is resized): log X errors, don't die of them. */
+static int x_error(Display *d, XErrorEvent *e)
+{
+	char text[128];
+	XGetErrorText(d, e->error_code, text, sizeof text);
+	dbg("X error: %s (request %d, resource 0x%lx)", text, e->request_code, e->resourceid);
+	return 0;
+}
+
 static int x_open(const char *name)
 {
 	x.dpy = x_connect(name);
@@ -239,6 +250,7 @@ static int x_open(const char *name)
 		return -1;
 	}
 	x_name = name;
+	XSetErrorHandler(x_error);
 	x.root = DefaultRootWindow(x.dpy);
 	if (!name) {
 		main_w = DisplayWidth(x.dpy, DefaultScreen(x.dpy));
@@ -2011,6 +2023,95 @@ static int phone_start(const client *cl)
 	return 0;
 }
 
+/* ---- the real screen for phones -------------------------------------- */
+
+/* By default a phone gets the real session, as Windows does it: the
+ * tablet's own screen goes off, the desktop takes the phone's size and
+ * text is scaled up to suit it, until the session ends (nwm puts floating
+ * windows back then). What restores it is written to a script first, so
+ * a crashed server's next start runs it. RDESK_PHONE=desktop gives phones
+ * a desktop of their own instead. */
+static void screen_back(void)
+{
+	if (access(screen_restore, F_OK))
+		return;
+	char cmd[700];
+	snprintf(cmd, sizeof cmd, "sh '%s'", screen_restore);
+	if (system(cmd))
+		msg("%s failed", screen_restore);
+	unlink(screen_restore);
+	msg("screen restored");
+}
+
+static const char *rot_name(Rotation r)
+{
+	return r & RR_Rotate_90 ? "left" : r & RR_Rotate_180 ? "inverted" : r & RR_Rotate_270 ? "right" : "normal";
+}
+
+static int screen_fit(const client *cl)
+{
+	int w = cl->cw & ~1, h = cl->ch & ~1; /* even, for H.264 */
+	XRRScreenResources *res = XRRGetScreenResourcesCurrent(x.dpy, x.root);
+	FILE *f = res ? fopen(screen_restore, "w") : NULL;
+	if (!f) {
+		if (res)
+			XRRFreeScreenResources(res);
+		msg("screen: cannot save how it is, not changing it");
+		return -1;
+	}
+	/* the outputs as they are, and the off switch for each */
+	char scale[32] = "";
+	FILE *g = popen("gsettings get org.cinnamon.desktop.interface text-scaling-factor 2>/dev/null", "r");
+	if (g) {
+		if (!fgets(scale, sizeof scale, g))
+			scale[0] = 0;
+		pclose(g);
+		scale[strcspn(scale, "\n")] = 0;
+	}
+	fputs("# rdesk-rdpc: the screen as it was before a phone took it\n", f);
+	/* text size first: windows sized by their text are their own size
+	 * again before nwm puts them back */
+	if (*scale)
+		fprintf(f, "gsettings set org.cinnamon.desktop.interface text-scaling-factor %s\nsleep 1\n", scale);
+	RROutput primary = XRRGetOutputPrimary(x.dpy, x.root);
+	char off[1024] = "xrandr";
+	fputs("xrandr", f);
+	for (int i = 0; i < res->noutput; i++) {
+		XRROutputInfo *o = XRRGetOutputInfo(x.dpy, res, res->outputs[i]);
+		XRRCrtcInfo *c = o && o->crtc ? XRRGetCrtcInfo(x.dpy, res, o->crtc) : NULL;
+		const char *mode = NULL;
+		for (int m = 0; c && m < res->nmode; m++)
+			if (res->modes[m].id == c->mode)
+				mode = res->modes[m].name;
+		if (mode) {
+			fprintf(f, " --output '%s' --mode '%s' --pos %dx%d --rotate %s%s", o->name, mode, c->x, c->y,
+				rot_name(c->rotation), res->outputs[i] == primary ? " --primary" : "");
+			snprintf(off + strlen(off), sizeof off - strlen(off), " --output '%s' --off", o->name);
+		}
+		if (c)
+			XRRFreeCrtcInfo(c);
+		if (o)
+			XRRFreeOutputInfo(o);
+	}
+	XRRFreeScreenResources(res);
+	fputc('\n', f);
+	fclose(f);
+
+	char cmd[1200];
+	snprintf(cmd, sizeof cmd, "%s --fb %dx%d", off, w, h);
+	if (system(cmd)) {
+		msg("screen: '%s' failed", cmd);
+		screen_back();
+		return -1;
+	}
+	double s = phone_dpi(cl) / 96.0;
+	snprintf(cmd, sizeof cmd, "gsettings set org.cinnamon.desktop.interface text-scaling-factor %.2f", s);
+	if (*scale && system(cmd))
+		msg("screen: text scaling not set");
+	msg("screen: %dx%d for the phone, text at %.2fx (was %s)", w, h, s, *scale ? scale : "?");
+	return 0;
+}
+
 /* The phone desktop's display for this client: the running one, or a new
  * one. NULL if it can't be had. */
 static const char *phone_open(const client *cl)
@@ -2097,7 +2198,15 @@ static void serve(int fd, SSL_CTX *ctx)
 	}
 	if (mcs_connect(&cl, &b) || mcs_domain(&cl, &b))
 		goto done;
-	if (x_switch(phone_wanted(&cl) ? phone_open(&cl) : NULL) || x_alloc_image())
+	const char *disp = NULL;
+	if (phone_wanted(&cl)) {
+		const char *how = getenv("RDESK_PHONE");
+		if (how && !strcmp(how, "desktop"))
+			disp = phone_open(&cl);
+		else
+			screen_fit(&cl); /* else the screen scaled into it */
+	}
+	if (x_switch(disp) || x_alloc_image())
 		goto done;
 	wins_init();
 	if (send_license(&cl) || send_demand_active(&cl))
@@ -2168,11 +2277,19 @@ done:
 	b_free(&cl.cliprdr_acc);
 	b_free(&cl.drdynvc_acc);
 	gfx_free(cl.gfx);
-	x_switch(NULL); /* idle on the real screen: the phone's may be started over */
+	x_switch(NULL);
+	screen_back(); /* idle on the real screen: the phone's may be started over */
 	msg("session ended");
 }
 
 /* ---- main ------------------------------------------------------------- */
+
+/* Killed: the screen back first, if a phone has it. */
+static void on_term(int sig)
+{
+	screen_back();
+	_exit(128 + sig);
+}
 
 static void usage(void)
 {
@@ -2256,11 +2373,23 @@ int main(int argc, char **argv)
 	snprintf(nthash_path, sizeof nthash_path, "%s/nthash", opt.certdir);
 	snprintf(phone_state, sizeof phone_state, "%s/phone.state", opt.certdir);
 	snprintf(phone_auth, sizeof phone_auth, "%s/phone.xauth", opt.certdir);
+	snprintf(screen_restore, sizeof screen_restore, "%s/screen-restore", opt.certdir);
 	if (set_password)
 		return store_password();
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGTERM, on_term);
+	signal(SIGINT, on_term);
+	/* gsettings needs the session bus; started from ssh there is none */
+	char bus[64];
+	snprintf(bus, sizeof bus, "/run/user/%d/bus", (int)getuid());
+	if (!getenv("DBUS_SESSION_BUS_ADDRESS") && !access(bus, F_OK)) {
+		char addr[80];
+		snprintf(addr, sizeof addr, "unix:path=%s", bus);
+		setenv("DBUS_SESSION_BUS_ADDRESS", addr, 1);
+	}
 	if (x_open(NULL))
 		return 1;
+	screen_back(); /* left phone-shaped by a crash */
 	SSL_CTX *ctx = tls_ctx();
 	if (!ctx)
 		return 1;

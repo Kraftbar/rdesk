@@ -4,7 +4,7 @@ LDLIBS_SSL = -lssl -lcrypto
 all: rdesk-rdpc rdesk-rdpc-client
 
 rdesk-rdpc: server.o rdp.o nla.o clip.o planar.o gfx.o rfx.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS_SSL) -lX11 -lXext -lXfixes -lXdamage -l:libXtst.so.6 -lx264 -lm
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS_SSL) -lX11 -lXext -lXfixes -lXdamage -lXrandr -l:libXtst.so.6 -lx264 -lm
 
 rdesk-rdpc-client: client.o rdp.o nla.o planar.o clip.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS_SSL) -lX11 -lXcursor -lXfixes
