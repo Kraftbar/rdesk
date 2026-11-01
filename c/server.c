@@ -21,11 +21,13 @@
 #include <X11/extensions/Xdamage.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <math.h>
 #include <linux/sockios.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <openssl/x509.h>
 #include <poll.h>
 #include <pwd.h>
@@ -61,7 +63,7 @@ static struct {
 	int no_nla;
 } opt = {"0.0.0.0", 3390, 30, NULL, "", 0};
 
-static char nthash_path[600];
+static char nthash_path[600], phone_state[600], phone_auth[600];
 
 /* RDESK_OFF=clip,cursor,frames: switch parts off (diagnostics). */
 static int off(const char *what)
@@ -209,14 +211,37 @@ static void win_event(XEvent *ev)
 	}
 }
 
-static int x_open(void)
+static int main_w, main_h;   /* the real screen */
+static const char *x_name; /* display x is on: NULL for $DISPLAY, else the phone's */
+
+static Display *x_connect(const char *name)
 {
-	x.dpy = XOpenDisplay(NULL);
+	if (!name)
+		return XOpenDisplay(NULL);
+	char *keep = getenv("XAUTHORITY") ? strdup(getenv("XAUTHORITY")) : NULL;
+	setenv("XAUTHORITY", phone_auth, 1);
+	Display *d = XOpenDisplay(name);
+	if (keep)
+		setenv("XAUTHORITY", keep, 1);
+	else
+		unsetenv("XAUTHORITY");
+	free(keep);
+	return d;
+}
+
+static int x_open(const char *name)
+{
+	x.dpy = x_connect(name);
 	if (!x.dpy) {
-		msg("cannot open display %s", getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)");
+		msg("cannot open display %s", name ? name : getenv("DISPLAY") ? getenv("DISPLAY") : "(unset)");
 		return -1;
 	}
+	x_name = name;
 	x.root = DefaultRootWindow(x.dpy);
+	if (!name) {
+		main_w = DisplayWidth(x.dpy, DefaultScreen(x.dpy));
+		main_h = DisplayHeight(x.dpy, DefaultScreen(x.dpy));
+	}
 	int err;
 	if (!XShmQueryExtension(x.dpy)) {
 		msg("no MIT-SHM");
@@ -227,6 +252,7 @@ static int x_open(void)
 		return -1;
 	}
 	XFixesSelectCursorInput(x.dpy, x.root, XFixesDisplayCursorNotifyMask);
+	x.damage = 0;
 	if (!off("damage") && XDamageQueryExtension(x.dpy, &x.damage_ev, &err)) {
 		x.damage = XDamageCreate(x.dpy, x.root, XDamageReportNonEmpty);
 		x.region = XFixesCreateRegion(x.dpy, NULL, 0);
@@ -545,6 +571,8 @@ typedef struct {
 	uint32_t selected;
 	int nla_ok;
 	uint16_t cw, ch;        /* client desktop size request */
+	uint32_t physw, physh;  /* its display in mm; 0 unknown */
+	uint32_t scale;         /* its scale in % */
 	int nchan;
 	char chan_name[MAX_CHANNELS][9];
 	uint32_t max_request;   /* multifragment max size from client */
@@ -663,19 +691,30 @@ static int parse_gcc_client(client *cl, buf *b)
 			return -1;
 		buf blk = {.p = b->p + start + 4, .len = len - 4};
 		if (type == 0xc001) { /* CS_CORE */
-			r_u32(&blk);
+			uint32_t ver = r_u32(&blk);
 			cl->cw = r_u16(&blk);
 			cl->ch = r_u16(&blk);
-			r_skip(&blk, 2 + 2 + 4 + 4);
+			r_skip(&blk, 2 + 2 + 4);
+			uint32_t build = r_u32(&blk);
 			char name[40];
 			r_utf16(&blk, 32, name, sizeof name);
 			r_skip(&blk, 12 + 64);
 			r_skip(&blk, 2 + 2 + 4);
 			uint16_t high = r_u16(&blk), supported = r_u16(&blk), early = r_u16(&blk);
-			msg("client '%s' %ux%u highColor %u supported 0x%x early 0x%x", name,
-			    cl->cw, cl->ch, high, supported, early);
+			msg("client '%s' %ux%u highColor %u supported 0x%x early 0x%x version 0x%x build %u", name,
+			    cl->cw, cl->ch, high, supported, early, ver, build);
 			if (!blk.err && !(early & 0x0002))
 				msg("warning: client does not ask for a 32 bpp session");
+			/* product id, connection type, pad, selected protocol, then
+			 * the physical size, orientation and scale */
+			if (r_left(&blk) >= 64 + 1 + 1 + 4 + 4 + 4 + 2 + 4) {
+				r_skip(&blk, 64 + 1 + 1 + 4);
+				cl->physw = r_u32(&blk);
+				cl->physh = r_u32(&blk);
+				r_skip(&blk, 2);
+				cl->scale = r_u32(&blk);
+				msg("client display %ux%u mm, scale %u%%", cl->physw, cl->physh, cl->scale);
+			}
 		} else if (type == 0xc003) { /* CS_NET */
 			uint32_t cnt = r_u32(&blk);
 			for (uint32_t k = 0; k < cnt && cl->nchan < MAX_CHANNELS; k++) {
@@ -1033,9 +1072,14 @@ static void queue_tile(const uint8_t *src, int stride, int tx, int ty, int w, in
 {
 	static uint8_t tile[TILE * TILE * 4], enc[planar_max(TILE, TILE) + 16];
 	static buf u;
-	static int raw = -1;
-	if (raw < 0)
+	static int raw = -1, pflags;
+	if (raw < 0) {
 		raw = getenv("RDESK_RAW") && *getenv("RDESK_RAW") == '1';
+		/* RDESK_PLANAR=swap|alpha: encoder variants, for clients that
+		 * show planar colours wrong */
+		const char *pv = getenv("RDESK_PLANAR");
+		pflags = !pv ? 0 : !strcmp(pv, "swap") ? PLANAR_SWAP_RB : !strcmp(pv, "alpha") ? PLANAR_ALPHA : 0;
+	}
 	int w4 = (w + 3) & ~3;
 	for (int r = 0; r < h; r++) {
 		/* raw bitmaps are bottom-up */
@@ -1058,7 +1102,7 @@ static void queue_tile(const uint8_t *src, int stride, int tx, int ty, int w, in
 		w_u16(&u, w4 * h * 4);
 		w_bytes(&u, tile, w4 * h * 4);
 	} else {
-		size_t n = planar_encode(tile, w4 * 4, w4, h, 1, enc);
+		size_t n = planar_encode(tile, w4 * 4, w4, h, 1, pflags, enc);
 		w_u16(&u, 0x0001); /* BITMAP_COMPRESSION */
 		w_u16(&u, 8 + n);
 		w_u16(&u, 0);                         /* cbCompFirstRowSize */
@@ -1366,8 +1410,14 @@ static int send_tiles(client *cl, const uint8_t *cur, uint8_t *prev, int stride,
 			queue_tile(cur, stride, tx + c0, ty + r0, c1 - c0 + 1, r1 - r0 + 1);
 			tiles++;
 			px += (c1 - c0 + 1) * (r1 - r0 + 1);
-			if (out.len > 256 * 1024 && flush_out(cl))
-				return -1;
+			if (out.len > 256 * 1024) {
+				int sz;
+				if (flush_out(cl))
+					return -1;
+				/* behind: the dirty tiles left wait, input goes first */
+				if (!cl->full && ioctl(cl->c.fd, SIOCOUTQ, &sz) == 0 && sz > OUTQ_MAX)
+					return 0;
+			}
 		}
 	}
 	cl->full = 0;
@@ -1703,6 +1753,229 @@ static int handle_slowpath(client *cl, buf *b, int *active)
 	}
 }
 
+/* ---- phone desktop ---------------------------------------------------- */
+
+/* A client that asks for much less than the screen (a phone) gets a
+ * desktop of its own instead of the screen squeezed into it: an Xvfb at
+ * its size running nwm. It outlives the session, and the server too (its
+ * display is noted in the cert dir), so the phone comes back to what it
+ * left, like a Windows session. ~/.config/rdesk/phone-session, if
+ * executable, runs instead of nwm and a terminal. RDESK_OFF=phone scales
+ * the screen instead; RDESK_PHONE_DPI=N sets its DPI. */
+static struct {
+	pid_t pid;
+	int num, w, h;
+	char name[16];
+} ph;
+
+/* Physical diagonal in mm, 0 if the client didn't say. */
+static double phys_diag(const client *cl)
+{
+	return cl->physw && cl->physh ? hypot(cl->physw, cl->physh) : 0;
+}
+
+/* A display under 26 cm (10") across, or a desktop under half the screen. */
+static int phone_wanted(const client *cl)
+{
+	if (off("phone") || !cl->cw || !cl->ch)
+		return 0;
+	double d = phys_diag(cl);
+	return (d && d < 260) || 2.0 * cl->cw * cl->ch < (double)main_w * main_h;
+}
+
+/* Text a bit smaller than the phone's own: at its full density (~400 dpi)
+ * a terminal is 40 columns. */
+static int phone_dpi(const client *cl)
+{
+	const char *e = getenv("RDESK_PHONE_DPI");
+	int dpi = e && atoi(e) > 0	  ? atoi(e)
+		  : phys_diag(cl)	  ? (int)(hypot(cl->cw, cl->ch) * 25.4 / phys_diag(cl) * 0.6)
+		  : cl->scale > 100	  ? 96 * (int)cl->scale / 100
+					  : 192;
+	return dpi < 96 ? 96 : dpi > 400 ? 400 : dpi;
+}
+
+static int phone_alive(void)
+{
+	if (ph.pid <= 0 || waitpid(ph.pid, NULL, WNOHANG) == ph.pid)
+		return 0;
+	char p[64], comm[32] = "";
+	snprintf(p, sizeof p, "/proc/%d/comm", (int)ph.pid);
+	FILE *f = fopen(p, "r");
+	if (f) {
+		if (!fgets(comm, sizeof comm, f))
+			comm[0] = 0;
+		fclose(f);
+	}
+	return !strncmp(comm, "Xvfb", 4);
+}
+
+/* Children of ours that live on: none of our descriptors (the client's
+ * socket would stay open) and their own session. */
+static void detach(void)
+{
+	setsid();
+	for (int fd = 3; fd < 1024; fd++)
+		close(fd);
+}
+
+static void w_be16(FILE *f, unsigned v)
+{
+	fputc(v >> 8, f);
+	fputc(v & 0xff, f);
+}
+
+static int phone_start(const client *cl)
+{
+	int dpi = phone_dpi(cl);
+	char lock[64], sock[64];
+	for (ph.num = 10; ph.num < 100; ph.num++) {
+		snprintf(lock, sizeof lock, "/tmp/.X%d-lock", ph.num);
+		snprintf(sock, sizeof sock, "/tmp/.X11-unix/X%d", ph.num);
+		if (access(lock, F_OK) && access(sock, F_OK))
+			break;
+	}
+	snprintf(ph.name, sizeof ph.name, ":%d", ph.num);
+	ph.w = cl->cw;
+	ph.h = cl->ch;
+
+	/* a fresh cookie, for any host (FamilyWild) on this display number */
+	uint8_t cookie[16];
+	RAND_bytes(cookie, sizeof cookie);
+	umask(077);
+	FILE *f = fopen(phone_auth, "wb");
+	if (!f) {
+		msg("cannot write %s", phone_auth);
+		return -1;
+	}
+	char num[8];
+	snprintf(num, sizeof num, "%d", ph.num);
+	w_be16(f, 0xffff);
+	w_be16(f, 0);
+	w_be16(f, strlen(num));
+	fputs(num, f);
+	w_be16(f, 18);
+	fputs("MIT-MAGIC-COOKIE-1", f);
+	w_be16(f, sizeof cookie);
+	fwrite(cookie, 1, sizeof cookie, f);
+	fclose(f);
+
+	char scr[32], dpis[8];
+	snprintf(scr, sizeof scr, "%dx%dx24", ph.w, ph.h);
+	snprintf(dpis, sizeof dpis, "%d", dpi);
+	ph.pid = fork();
+	if (ph.pid == 0) {
+		detach();
+		execlp("Xvfb", "Xvfb", ph.name, "-screen", "0", scr, "-dpi", dpis, "-nolisten", "tcp", "-auth",
+		       phone_auth, "-noreset", (char *)NULL);
+		_exit(127);
+	}
+	Display *d = NULL;
+	for (int i = 0; i < 50 && !d; i++) {
+		if (waitpid(ph.pid, NULL, WNOHANG) == ph.pid) {
+			msg("Xvfb exited (installed? apt install xvfb)");
+			ph.pid = 0;
+			return -1;
+		}
+		usleep(100000);
+		d = x_connect(ph.name);
+	}
+	if (!d) {
+		msg("Xvfb on %s did not come up", ph.name);
+		kill(ph.pid, SIGTERM);
+		ph.pid = 0;
+		return -1;
+	}
+	XCloseDisplay(d);
+	if ((f = fopen(phone_state, "w"))) {
+		fprintf(f, "%d %d %d %d\n", (int)ph.pid, ph.num, ph.w, ph.h);
+		fclose(f);
+	}
+
+	/* Firefox on the desk holds the profile and would take the phone's
+	 * windows: the phone's runs its own */
+	char bin[640];
+	snprintf(bin, sizeof bin, "%s/phone-bin", opt.certdir);
+	mkdir(bin, 0700);
+	strncat(bin, "/firefox", sizeof bin - strlen(bin) - 1);
+	if ((f = fopen(bin, "w"))) {
+		fputs("#!/bin/sh\n"
+		      "# Firefox on the phone desktop (rdesk-rdpc): the desk's has the default profile\n"
+		      "p=\"$HOME/.mozilla/rdesk-phone\"\n"
+		      "mkdir -p \"$p\"\n"
+		      "exec /usr/bin/firefox --no-remote --profile \"$p\" \"$@\"\n",
+		      f);
+		fclose(f);
+		chmod(bin, 0755);
+	}
+
+	/* its own D-Bus too, or single-instance apps open on the desk */
+	pid_t s = fork();
+	if (s == 0) {
+		detach();
+		if (fork())
+			_exit(0);
+		char cmd[2048];
+		snprintf(cmd, sizeof cmd,
+			 "cd; echo 'Xft.dpi: %d' | xrdb -merge; export PATH='%s/phone-bin':\"$PATH\"; "
+			 "unset DBUS_SESSION_BUS_ADDRESS SESSION_MANAGER; f='%s/phone-session'; "
+			 "[ -x \"$f\" ] && exec dbus-run-session \"$f\"; "
+			 "exec dbus-run-session sh -c 'xfce4-terminal --disable-server --maximize & exec nwm -n'",
+			 dpi, opt.certdir, opt.certdir);
+		setenv("DISPLAY", ph.name, 1);
+		setenv("XAUTHORITY", phone_auth, 1);
+		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+		_exit(127);
+	}
+	waitpid(s, NULL, 0);
+	msg("phone desktop %s: %dx%d at %d dpi", ph.name, ph.w, ph.h, dpi);
+	return 0;
+}
+
+/* The phone desktop's display for this client: the running one, or a new
+ * one. NULL if it can't be had. */
+static const char *phone_open(const client *cl)
+{
+	if (!ph.pid) { /* left by an earlier server? */
+		FILE *f = fopen(phone_state, "r");
+		if (f) {
+			if (fscanf(f, "%d %d %d %d", &ph.pid, &ph.num, &ph.w, &ph.h) != 4)
+				ph.pid = 0;
+			fclose(f);
+			snprintf(ph.name, sizeof ph.name, ":%d", ph.num);
+		}
+	}
+	if (!phone_alive()) {
+		ph.pid = 0;
+	} else if (ph.w != cl->cw || ph.h != cl->ch) {
+		msg("phone desktop %s is %dx%d, client wants %ux%u: starting it over", ph.name, ph.w, ph.h, cl->cw,
+		    cl->ch);
+		kill(ph.pid, SIGTERM);
+		waitpid(ph.pid, NULL, 0);
+		ph.pid = 0;
+	} else {
+		msg("phone desktop %s: back to it", ph.name);
+	}
+	if (!ph.pid && phone_start(cl))
+		return NULL;
+	return ph.name;
+}
+
+/* Move x to another display (NULL: the real screen). */
+static int x_switch(const char *name)
+{
+	if (name == x_name || (name && x_name && !strcmp(name, x_name)))
+		return 0;
+	x_free_image();
+	XCloseDisplay(x.dpy);
+	spare_kc = -1;
+	spare_bound = 0;
+	nwins = 0;
+	if (!x_open(name))
+		return 0;
+	return name ? x_open(NULL) : -1;
+}
+
 static void serve(int fd, SSL_CTX *ctx)
 {
 	client cl = {0};
@@ -1744,7 +2017,7 @@ static void serve(int fd, SSL_CTX *ctx)
 	}
 	if (mcs_connect(&cl, &b) || mcs_domain(&cl, &b))
 		goto done;
-	if (x_alloc_image())
+	if (x_switch(phone_wanted(&cl) ? phone_open(&cl) : NULL) || x_alloc_image())
 		goto done;
 	wins_init();
 	if (send_license(&cl) || send_demand_active(&cl))
@@ -1752,6 +2025,7 @@ static void serve(int fd, SSL_CTX *ctx)
 
 	int64_t next = now_ms();
 	int xfd = ConnectionNumber(x.dpy);
+	int busy = 0; /* input waiting: read it all before the next frame */
 	for (;;) {
 		while (XPending(x.dpy)) {
 			XEvent ev;
@@ -1766,7 +2040,7 @@ static void serve(int fd, SSL_CTX *ctx)
 				win_event(&ev);
 		}
 		int64_t t = now_ms();
-		if (active && t >= next) {
+		if (active && t >= next && !busy) {
 			next += 1000 / opt.fps;
 			if (next < t)
 				next = t + 1000 / opt.fps;
@@ -1775,7 +2049,7 @@ static void serve(int fd, SSL_CTX *ctx)
 			if (!cl.suppress && !off("frames") && send_frame(&cl))
 				break;
 		}
-		if (c_pending(&cl.c) == 0) {
+		if (!busy && c_pending(&cl.c) == 0) {
 			struct pollfd p[2] = {{fd, POLLIN, 0}, {xfd, POLLIN, 0}};
 			int to = active ? (int)(next - now_ms()) : 1000;
 			if (to < 0)
@@ -1800,6 +2074,8 @@ static void serve(int fd, SSL_CTX *ctx)
 		} else if (handle_slowpath(&cl, &b, &active)) {
 			break;
 		}
+		struct pollfd q = {fd, POLLIN, 0};
+		busy = c_pending(&cl.c) > 0 || poll(&q, 1, 0) > 0;
 	}
 done:
 	if (cl.c.ssl) {
@@ -1810,6 +2086,7 @@ done:
 	b_free(&b);
 	clip_free(cl.clip);
 	b_free(&cl.cliprdr_acc);
+	x_switch(NULL); /* idle on the real screen: the phone's may be started over */
 	msg("session ended");
 }
 
@@ -1895,10 +2172,12 @@ int main(int argc, char **argv)
 		}
 	}
 	snprintf(nthash_path, sizeof nthash_path, "%s/nthash", opt.certdir);
+	snprintf(phone_state, sizeof phone_state, "%s/phone.state", opt.certdir);
+	snprintf(phone_auth, sizeof phone_auth, "%s/phone.xauth", opt.certdir);
 	if (set_password)
 		return store_password();
 	signal(SIGPIPE, SIG_IGN);
-	if (x_open())
+	if (x_open(NULL))
 		return 1;
 	SSL_CTX *ctx = tls_ctx();
 	if (!ctx)

@@ -170,15 +170,27 @@ static void rle_line(const uint8_t *v, int w, uint8_t **o)
 		seg(o, raw, k, 0);
 }
 
-size_t planar_encode(const uint8_t *src, int stride, int w, int h, int vflip, uint8_t *out)
+size_t planar_encode(const uint8_t *src, int stride, int w, int h, int vflip, int flags, uint8_t *out)
 {
 	uint8_t *o = out, *cur = malloc(w), *prev = malloc(w), *sym = malloc(w);
-	*o++ = 0x30; /* RLE | no alpha, no color loss */
-	for (int plane = 2; plane >= 0; plane--) { /* R, G, B = bytes 2, 1, 0 of BGRX */
+	/* planes as bytes of BGRX: R, G, B; -1 is an opaque alpha plane */
+	int planes[4] = {2, 1, 0}, np = 3;
+	if (flags & PLANAR_SWAP_RB) {
+		planes[0] = 0;
+		planes[2] = 2;
+	}
+	if (flags & PLANAR_ALPHA) {
+		memmove(planes + 1, planes, 3 * sizeof *planes);
+		planes[0] = -1;
+		np = 4;
+	}
+	*o++ = flags & PLANAR_ALPHA ? 0x10 : 0x30; /* RLE, no alpha plane unless asked, no color loss */
+	for (int pi = 0; pi < np; pi++) {
+		int plane = planes[pi];
 		for (int y = 0; y < h; y++) {
 			const uint8_t *row = src + (size_t)(vflip ? h - 1 - y : y) * stride;
 			for (int x = 0; x < w; x++)
-				cur[x] = row[x * 4 + plane];
+				cur[x] = plane < 0 ? 0xff : row[x * 4 + plane];
 			if (!y) {
 				memcpy(sym, cur, w);
 			} else {
