@@ -4,7 +4,7 @@
  * fast-path bitmap updates of changed 64x64 tiles, fast-path input via
  * XTest, XFixes cursor shapes. One client at a time. DAMAGE says which
  * tiles were drawn to; only those rows are grabbed and compared. Moved
- * top-level windows go out as ScrBlt copies first. */
+ * top-level windows and scrolled areas go out as ScrBlt copies first. */
 #define _GNU_SOURCE
 #include "rdp.h"
 #include "nla.h"
@@ -1035,9 +1035,64 @@ static void queue_tile(int tx, int ty, int w, int h)
 	fp_update(&out, FP_UPD_BITMAP, u.p, u.len);
 }
 
+/* Where scrolling is looked for this frame: per visible top-level window,
+ * the bounding box of its damage (toolkits draw a scroll line by line). */
+#define SCROLL_MIN 48 /* rows a scroll copy must cover */
+static XRectangle drects[32];
+static int ndrects;
+
+static void scroll_candidates(const XRectangle *r, int n)
+{
+	Window root, parent, *kids;
+	unsigned nk;
+	if (!n || !XQueryTree(x.dpy, x.root, &root, &parent, &kids, &nk))
+		return;
+	/* each damaged rectangle belongs to the topmost window over its centre */
+	int *box = malloc(nwins * 4 * sizeof *box);
+	for (int k = 0; k < nwins; k++) {
+		box[4 * k] = box[4 * k + 1] = INT32_MAX;
+		box[4 * k + 2] = box[4 * k + 3] = INT32_MIN;
+	}
+	for (int i = 0; i < n; i++) {
+		int cx = r[i].x + r[i].width / 2, cy = r[i].y + r[i].height / 2;
+		for (int k = (int)nk - 1; k >= 0; k--) {
+			topwin *t = win_find(kids[k], 0);
+			if (!t || !t->mapped || t->input_only || cx < t->x || cy < t->y || cx >= t->x + t->w ||
+			    cy >= t->y + t->h)
+				continue;
+			int *b = &box[4 * (t - wins)];
+			b[0] = r[i].x < b[0] ? r[i].x : b[0];
+			b[1] = r[i].y < b[1] ? r[i].y : b[1];
+			b[2] = r[i].x + r[i].width > b[2] ? r[i].x + r[i].width : b[2];
+			b[3] = r[i].y + r[i].height > b[3] ? r[i].y + r[i].height : b[3];
+			break;
+		}
+	}
+	XFree(kids);
+	for (int k = 0; k < nwins && ndrects < 32; k++) {
+		topwin *t = &wins[k];
+		int *b = &box[4 * k];
+		int x0 = b[0] > t->x ? b[0] : t->x, y0 = b[1] > t->y ? b[1] : t->y;
+		int x1 = b[2] < t->x + t->w ? b[2] : t->x + t->w, y1 = b[3] < t->y + t->h ? b[3] : t->y + t->h;
+		x0 = x0 < 0 ? 0 : x0;
+		y0 = y0 < 0 ? 0 : y0;
+		x1 = x1 > x.w ? x.w : x1;
+		y1 = y1 > x.h ? x.h : y1;
+		if (x1 - x0 < 128 || y1 - y0 < 2 * SCROLL_MIN)
+			continue;
+		drects[ndrects++] = (XRectangle){x0, y0, x1 - x0, y1 - y0};
+		/* rows between damaged ones get grabbed too, or detection
+		 * would read stale pixels there */
+		for (int ty = y0 / TILE; ty <= (y1 - 1) / TILE; ty++)
+			memset(x.dirty + ty * x.tw + x0 / TILE, 1, (x1 - 1) / TILE - x0 / TILE + 1);
+	}
+	free(box);
+}
+
 /* Mark the tiles drawn to since the last call. */
 static void collect_damage(void)
 {
+	ndrects = 0;
 	if (!x.damage) {
 		memset(x.dirty, 1, x.tw * x.th);
 		return;
@@ -1060,6 +1115,7 @@ static void collect_damage(void)
 		for (int ty = y0; ty <= y1; ty++)
 			memset(x.dirty + ty * x.tw + x0, 1, x1 >= x0 ? x1 - x0 + 1 : 0);
 	}
+	scroll_candidates(r, n);
 	if (r)
 		XFree(r);
 }
@@ -1122,6 +1178,104 @@ static void copy_rect(int sx, int sy, int w, int h, int dx, int dy)
 	mark_dirty(dx, dy, w, h);
 }
 
+/* n pixels, two at a time on two lanes */
+static uint64_t row_hash(const uint8_t *p, int n)
+{
+	const uint64_t *q = (const uint64_t *)p;
+	uint64_t a = 0xcbf29ce484222325ull, b = 0x84222325cbf29ce4ull;
+	int i = 0;
+	for (; i + 1 < n / 2; i += 2) {
+		a = (a ^ q[i]) * 0x100000001b3ull;
+		b = (b ^ q[i + 1]) * 0x100000001b3ull;
+	}
+	if (i < n / 2)
+		a = (a ^ q[i]) * 0x100000001b3ull;
+	return a ^ (b * 31);
+}
+
+/* Find content in rectangle r that moved vertically since the client last
+ * saw it and send it as a ScrBlt. Rows are matched by hashes of a centre
+ * strip (scrollbars and side panels stay out of it); the most common shift
+ * wins, its longest run of matching rows is copied, widened sideways while
+ * the columns still match on every 8th row (the tile diff catches what that
+ * misses). Needs this frame's rows of r in x.img. */
+static void detect_scroll(XRectangle r)
+{
+	int x0 = r.x, y0 = r.y, w = r.width, h = r.height;
+	int stride = x.img->bytes_per_line, sx = x0 + w / 4, sw = w / 2;
+	uint64_t *hn = malloc(h * sizeof *hn), *ho = malloc(h * sizeof *ho);
+	int cap = 1;
+	while (cap < 2 * h)
+		cap <<= 1;
+	int *tab = malloc(cap * sizeof *tab), *votes = calloc(2 * h, sizeof *votes);
+	uint8_t *dup = calloc(h, 1);
+	memset(tab, -1, cap * sizeof *tab);
+	for (int i = 0; i < h; i++) {
+		size_t o = (size_t)(y0 + i) * stride + sx * 4;
+		hn[i] = row_hash((uint8_t *)x.img->data + o, sw);
+		ho[i] = row_hash(x.prev + o, sw);
+		int k = ho[i] & (cap - 1);
+		while (tab[k] >= 0 && ho[tab[k]] != ho[i])
+			k = (k + 1) & (cap - 1);
+		if (tab[k] >= 0)
+			dup[tab[k]] = 1; /* blank lines and the like: no vote */
+		else
+			tab[k] = i;
+	}
+	for (int i = 0; i < h; i++) {
+		if (hn[i] == ho[i])
+			continue;
+		int k = hn[i] & (cap - 1);
+		while (tab[k] >= 0 && ho[tab[k]] != hn[i])
+			k = (k + 1) & (cap - 1);
+		if (tab[k] >= 0 && !dup[tab[k]])
+			votes[i - tab[k] + h]++;
+	}
+	int best = h;
+	for (int i = 0; i < 2 * h; i++)
+		if (votes[i] > votes[best])
+			best = i;
+	int dy = best - h;
+	if (votes[best] < 8)
+		goto out;
+	/* longest run of rows i whose strip matches old row i - dy */
+	int rs = 0, len = 0;
+	for (int i = dy > 0 ? dy : 0, run = 0; i < (dy < 0 ? h + dy : h); i++) {
+		run = hn[i] == ho[i - dy] ? run + 1 : 0;
+		if (run > len) {
+			len = run;
+			rs = i - run + 1;
+		}
+	}
+	if (len < SCROLL_MIN)
+		goto out;
+	int cl = sx, cr = sx + sw;
+	for (;; cl--) {
+		int c = cl - 1, ok = c >= x0;
+		for (int i = rs; ok && i < rs + len; i += 8)
+			ok = !memcmp(x.img->data + (size_t)(y0 + i) * stride + c * 4,
+				     x.prev + (size_t)(y0 + i - dy) * stride + c * 4, 4);
+		if (!ok)
+			break;
+	}
+	for (;; cr++) {
+		int ok = cr < x0 + w;
+		for (int i = rs; ok && i < rs + len; i += 8)
+			ok = !memcmp(x.img->data + (size_t)(y0 + i) * stride + cr * 4,
+				     x.prev + (size_t)(y0 + i - dy) * stride + cr * 4, 4);
+		if (!ok)
+			break;
+	}
+	dbg("scroll %dx%d by %+d", cr - cl, len, dy);
+	copy_rect(cl, y0 + rs - dy, cr - cl, len, cl, y0 + rs);
+out:
+	free(hn);
+	free(ho);
+	free(tab);
+	free(votes);
+	free(dup);
+}
+
 static void send_moves(client *cl)
 {
 	for (int i = 0; i < nwins; i++) {
@@ -1159,6 +1313,8 @@ static int send_frame(client *cl)
 			return -1;
 		r = r1;
 	}
+	for (int i = 0; cl->scrblt && !cl->full && i < ndrects; i++)
+		detect_scroll(drects[i]);
 	int stride = x.img->bytes_per_line, tiles = 0, px = 0;
 	for (int ty = 0; ty < x.h; ty += TILE) {
 		int h = ty + TILE > x.h ? x.h - ty : TILE;
