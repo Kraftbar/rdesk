@@ -3,7 +3,8 @@
  * Milestone 1: TLS security, slow-path connection sequence, raw 32 bpp
  * fast-path bitmap updates of changed 64x64 tiles, fast-path input via
  * XTest, XFixes cursor shapes. One client at a time. DAMAGE says which
- * tiles were drawn to; only those rows are grabbed and compared. */
+ * tiles were drawn to; only those rows are grabbed and compared. Moved
+ * top-level windows go out as ScrBlt copies first. */
 #define _GNU_SOURCE
 #include "rdp.h"
 #include "nla.h"
@@ -97,6 +98,116 @@ static struct {
 	uint8_t *dirty;  /* per tile, tw x th */
 	int tw, th;
 } x;
+
+/* Top-level windows: where they are now, and where the client last saw
+ * them (sx, sy), so a move can go out as one ScrBlt. */
+typedef struct {
+	Window id;
+	int x, y, w, h, sx, sy, mapped;
+	int input_only; /* no pixels (nwm's resize handles): never copied */
+} topwin;
+static topwin *wins;
+static int nwins;
+
+static topwin *win_find(Window id, int add)
+{
+	for (int i = 0; i < nwins; i++)
+		if (wins[i].id == id)
+			return &wins[i];
+	if (!add)
+		return NULL;
+	XWindowAttributes wa;
+	int io = !XGetWindowAttributes(x.dpy, id, &wa) || wa.class == InputOnly;
+	wins = realloc(wins, (nwins + 1) * sizeof *wins);
+	wins[nwins] = (topwin){.id = id, .input_only = io};
+	return &wins[nwins++];
+}
+
+static void win_drop(Window id)
+{
+	topwin *t = win_find(id, 0);
+	if (t)
+		*t = wins[--nwins];
+}
+
+static void win_set(Window id, int wx, int wy, int w, int h, int bw)
+{
+	topwin *t = win_find(id, 1);
+	if (t->w != w + 2 * bw || t->h != h + 2 * bw) {
+		t->sx = wx; /* resized: no copy */
+		t->sy = wy;
+	}
+	t->x = wx;
+	t->y = wy;
+	t->w = w + 2 * bw;
+	t->h = h + 2 * bw;
+}
+
+static void wins_init(void)
+{
+	XWindowAttributes wa;
+	XGetWindowAttributes(x.dpy, x.root, &wa);
+	XSelectInput(x.dpy, x.root, wa.your_event_mask | SubstructureNotifyMask);
+	Window r, p, *kids;
+	unsigned n;
+	nwins = 0;
+	if (!XQueryTree(x.dpy, x.root, &r, &p, &kids, &n))
+		return;
+	for (unsigned i = 0; i < n; i++) {
+		if (!XGetWindowAttributes(x.dpy, kids[i], &wa))
+			continue;
+		win_set(kids[i], wa.x, wa.y, wa.width, wa.height, wa.border_width);
+		win_find(kids[i], 0)->mapped = wa.map_state == IsViewable;
+	}
+	XFree(kids);
+}
+
+/* Root's children come and go, move and resize. */
+static void win_event(XEvent *ev)
+{
+	switch (ev->type) {
+	case CreateNotify: {
+		XCreateWindowEvent *e = &ev->xcreatewindow;
+		win_set(e->window, e->x, e->y, e->width, e->height, e->border_width);
+		break;
+	}
+	case DestroyNotify:
+		win_drop(ev->xdestroywindow.window);
+		break;
+	case ConfigureNotify: {
+		XConfigureEvent *e = &ev->xconfigure;
+		if (e->event == x.root)
+			win_set(e->window, e->x, e->y, e->width, e->height, e->border_width);
+		break;
+	}
+	case MapNotify: {
+		topwin *t = win_find(ev->xmap.window, 0);
+		if (t) {
+			t->mapped = 1;
+			t->sx = t->x; /* newly drawn, nothing to copy */
+			t->sy = t->y;
+		}
+		break;
+	}
+	case UnmapNotify: {
+		topwin *t = win_find(ev->xunmap.window, 0);
+		if (t)
+			t->mapped = 0;
+		break;
+	}
+	case ReparentNotify: {
+		XReparentEvent *e = &ev->xreparent;
+		if (e->parent != x.root) {
+			win_drop(e->window);
+		} else {
+			XWindowAttributes wa;
+			if (XGetWindowAttributes(x.dpy, e->window, &wa))
+				win_set(e->window, wa.x, wa.y, wa.width, wa.height, wa.border_width);
+		}
+		break;
+	}
+	}
+}
 
 static int x_open(void)
 {
@@ -419,6 +530,7 @@ typedef struct {
 	int full;               /* send every tile next frame */
 	int cursor_dirty;
 	char username[256];
+	int scrblt;             /* client takes ScrBlt orders */
 	uint16_t cliprdr;       /* channel id, 0 if not offered */
 	buf cliprdr_acc;
 	clip *clip;
@@ -775,13 +887,18 @@ static void parse_confirm_active(client *cl, buf *b)
 		case CAP_MULTIFRAG:
 			cl->max_request = r_u32(&c);
 			break;
+		case CAP_ORDER:
+			r_skip(&c, 32 + 2); /* to orderSupport[TS_NEG_SCRBLT_INDEX] */
+			cl->scrblt = r_u8(&c) && !b->err && !off("scrblt");
+			break;
 		case CAP_INPUT:
 			dbg("client input flags 0x%x", r_u16(&c));
 			break;
 		}
 		b->pos = start + len;
 	}
-	msg("confirm active: fastpath output %d, multifrag %u", cl->fastpath_out, cl->max_request);
+	msg("confirm active: fastpath output %d, multifrag %u, scrblt %d", cl->fastpath_out, cl->max_request,
+	    cl->scrblt);
 }
 
 static int send_sync(client *cl)
@@ -957,12 +1074,76 @@ static int grab_rows(int y, int h)
 	return !XShmGetImage(x.dpy, x.root, &band, 0, y, AllPlanes);
 }
 
+static void mark_dirty(int rx, int ry, int w, int h)
+{
+	int x0 = rx / TILE, y0 = ry / TILE;
+	int x1 = (rx + w - 1) / TILE, y1 = (ry + h - 1) / TILE;
+	for (int ty = y0; ty <= y1; ty++)
+		memset(x.dirty + ty * x.tw + x0, 1, x1 - x0 + 1);
+}
+
+/* Copy w x h from (sx, sy) to (dx, dy) on the client with a ScrBlt order,
+ * and the same in x.prev, which mirrors the client's screen. Whatever the
+ * copy got wrong (other windows on top) shows up in the tile diff. */
+static void copy_rect(int sx, int sy, int w, int h, int dx, int dy)
+{
+	if (sx < 0) { w += sx; dx -= sx; sx = 0; }
+	if (dx < 0) { w += dx; sx -= dx; dx = 0; }
+	if (sy < 0) { h += sy; dy -= sy; sy = 0; }
+	if (dy < 0) { h += dy; sy -= dy; dy = 0; }
+	if (sx + w > x.w) w = x.w - sx;
+	if (dx + w > x.w) w = x.w - dx;
+	if (sy + h > x.h) h = x.h - sy;
+	if (dy + h > x.h) h = x.h - dy;
+	if (w <= 0 || h <= 0)
+		return;
+	static buf u;
+	b_reset(&u);
+	w_u16(&u, 1);    /* numberOrders */
+	w_u8(&u, 0x09);  /* TS_STANDARD | TS_TYPE_CHANGE */
+	w_u8(&u, 0x02);  /* TS_ENC_SCRBLT_ORDER */
+	w_u8(&u, 0x7f);  /* all seven fields */
+	w_u16(&u, dx);
+	w_u16(&u, dy);
+	w_u16(&u, w);
+	w_u16(&u, h);
+	w_u8(&u, 0xcc);  /* SRCCOPY */
+	w_u16(&u, sx);
+	w_u16(&u, sy);
+	fp_update(&out, FP_UPD_ORDERS, u.p, u.len);
+
+	int stride = x.img->bytes_per_line;
+	for (int i = 0; i < h; i++) {
+		int r = dy > sy ? h - 1 - i : i;
+		memmove(x.prev + (size_t)(dy + r) * stride + dx * 4, x.prev + (size_t)(sy + r) * stride + sx * 4,
+			(size_t)w * 4);
+	}
+	mark_dirty(sx, sy, w, h);
+	mark_dirty(dx, dy, w, h);
+}
+
+static void send_moves(client *cl)
+{
+	for (int i = 0; i < nwins; i++) {
+		topwin *t = &wins[i];
+		if (t->x == t->sx && t->y == t->sy)
+			continue;
+		if (cl->scrblt && t->mapped && !t->input_only && !cl->full) {
+			dbg("move %dx%d by %+d%+d", t->w, t->h, t->x - t->sx, t->y - t->sy);
+			copy_rect(t->sx, t->sy, t->w, t->h, t->x, t->y);
+		}
+		t->sx = t->x;
+		t->sy = t->y;
+	}
+}
+
 static int send_frame(client *cl)
 {
 	int sz;
 	if (ioctl(cl->c.fd, SIOCOUTQ, &sz) == 0 && sz > OUTQ_MAX)
 		return 0; /* link is behind: drop this frame */
 	collect_damage();
+	send_moves(cl);
 	if (cl->full)
 		memset(x.dirty, 1, x.tw * x.th);
 	for (int r = 0; r < x.th;) {
@@ -978,7 +1159,7 @@ static int send_frame(client *cl)
 			return -1;
 		r = r1;
 	}
-	int stride = x.img->bytes_per_line, tiles = 0;
+	int stride = x.img->bytes_per_line, tiles = 0, px = 0;
 	for (int ty = 0; ty < x.h; ty += TILE) {
 		int h = ty + TILE > x.h ? x.h - ty : TILE;
 		for (int tx = 0; tx < x.w; tx += TILE) {
@@ -987,26 +1168,40 @@ static int send_frame(client *cl)
 			if (!*d)
 				continue;
 			*d = 0;
-			int changed = cl->full;
-			for (int r = 0; r < h && !changed; r++) {
-				size_t o = (size_t)(ty + r) * stride + tx * 4;
-				changed = memcmp(x.img->data + o, x.prev + o, w * 4) != 0;
-			}
-			if (!changed)
-				continue;
+			/* bounding box of the changed pixels in this tile */
+			int r0 = h, r1 = -1, c0 = w, c1 = -1;
 			for (int r = 0; r < h; r++) {
 				size_t o = (size_t)(ty + r) * stride + tx * 4;
+				const uint32_t *a = (uint32_t *)(x.img->data + o), *p = (uint32_t *)(x.prev + o);
+				if (!cl->full && !memcmp(a, p, w * 4))
+					continue;
+				if (r0 == h)
+					r0 = r;
+				r1 = r;
+				int c = 0;
+				while (c < c0 && a[c] == p[c] && !cl->full)
+					c++;
+				if (c < c0)
+					c0 = c;
+				c = w - 1;
+				while (c > c1 && a[c] == p[c] && !cl->full)
+					c--;
+				if (c > c1)
+					c1 = c;
 				memcpy(x.prev + o, x.img->data + o, w * 4);
 			}
-			queue_tile(tx, ty, w, h);
+			if (r1 < 0)
+				continue;
+			queue_tile(tx + c0, ty + r0, c1 - c0 + 1, r1 - r0 + 1);
 			tiles++;
+			px += (c1 - c0 + 1) * (r1 - r0 + 1);
 			if (out.len > 256 * 1024 && flush_out(cl))
 				return -1;
 		}
 	}
 	cl->full = 0;
 	if (tiles)
-		dbg("frame: %d tiles", tiles);
+		dbg("frame: %d tiles, %d px", tiles, px);
 	return flush_out(cl);
 }
 
@@ -1248,6 +1443,7 @@ static void serve(int fd, SSL_CTX *ctx)
 		goto done;
 	if (x_alloc_image())
 		goto done;
+	wins_init();
 	if (send_license(&cl) || send_demand_active(&cl))
 		goto done;
 
@@ -1263,6 +1459,8 @@ static void serve(int fd, SSL_CTX *ctx)
 				cl.cursor_dirty = 1;
 			else if (x.damage && ev.type == x.damage_ev + XDamageNotify)
 				x.damaged = 1;
+			else
+				win_event(&ev);
 		}
 		int64_t t = now_ms();
 		if (active && t >= next) {

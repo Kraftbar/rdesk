@@ -126,6 +126,7 @@ int parse_mcs(buf *b, uint16_t *user, uint16_t *chan);
 #define CAP_MULTIFRAG 26
 
 /* fast-path output */
+#define FP_UPD_ORDERS 0x0
 #define FP_UPD_BITMAP 0x1
 #define FP_UPD_PTR_NULL 0x5
 #define FP_UPD_PTR_DEFAULT 0x6
