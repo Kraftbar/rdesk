@@ -448,14 +448,19 @@ static void in_mouse(uint16_t f, uint16_t mx, uint16_t my)
 {
 	map_pointer(&mx, &my);
 	if (f & (PTR_WHEEL | PTR_HWHEEL)) {
-		int rot = f & 0xff;
+		/* phones scroll in steps of a fraction of a notch (120): add
+		 * them up, a notch per 120, else each step scrolls a notch */
+		static int acc[2];
+		int rot = f & 0xff, h = !(f & PTR_WHEEL);
 		if (f & PTR_WHEEL_NEG)
 			rot = -(0x100 - rot);
-		int n = abs(rot) / 120;
-		if (f & PTR_WHEEL)
-			click(rot > 0 ? 4 : 5, n);
-		else
-			click(rot > 0 ? 7 : 6, n);
+		if ((acc[h] < 0) != (rot < 0))
+			acc[h] = 0; /* turned round */
+		acc[h] += rot;
+		for (; acc[h] >= 120; acc[h] -= 120)
+			click(h ? 7 : 4, 1);
+		for (; acc[h] <= -120; acc[h] += 120)
+			click(h ? 6 : 5, 1);
 		return;
 	}
 	if (f & PTR_MOVE || f & (PTR_BUTTON1 | PTR_BUTTON2 | PTR_BUTTON3))
