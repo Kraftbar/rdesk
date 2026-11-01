@@ -2,8 +2,10 @@
  * RGB to YCbCr (ICT) with 5 fractional bits, three levels of the 5/3
  * wavelet (DWT_53_A), scalar quantization, LL3 differences, RLGR1. */
 #include "rfx.h"
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define T 64
 
@@ -194,7 +196,7 @@ static int16_t clamp12(int v)
  * component data, after a different header. */
 static void encode_tile(buf *out, const uint8_t *cur, int stride, int w, int h, int tx, int ty, int progressive)
 {
-	static int16_t yc[T * T], cb[T * T], cr[T * T];
+	int16_t yc[T * T], cb[T * T], cr[T * T]; /* per thread */
 	/* edge tiles repeat their last pixel */
 	for (int r = 0; r < T; r++) {
 		int sy = ty * T + r < h ? ty * T + r : h - 1;
@@ -227,6 +229,72 @@ static void encode_tile(buf *out, const uint8_t *cur, int stride, int w, int h, 
 		put_u16(out, lens + 2 * i, out->len - start);
 	}
 	put_u32(out, at + 2, out->len - at);
+}
+
+/* A run of tiles (indexes into the tw-wide grid) for one thread. */
+typedef struct {
+	const uint8_t *cur;
+	int stride, w, h, tw, progressive;
+	const int *tiles;
+	int n;
+	buf out;
+} job;
+
+static void *run_job(void *arg)
+{
+	job *j = arg;
+	for (int i = 0; i < j->n; i++)
+		encode_tile(&j->out, j->cur, j->stride, j->w, j->h, j->tiles[i] % j->tw, j->tiles[i] / j->tw,
+			    j->progressive);
+	return NULL;
+}
+
+/* The marked tiles onto o, in grid order. A whole-screen change is a few
+ * hundred tiles at a quarter millisecond each: split over the cores,
+ * contiguous runs, appended in order. */
+static void encode_tiles(buf *o, const uint8_t *cur, int stride, int w, int h, const uint8_t *mark, int tw, int th,
+			 int progressive)
+{
+	enum { MAXJOBS = 8, MINRUN = 16 };
+	int *tiles = malloc(tw * th * sizeof *tiles), count = 0;
+	for (int i = 0; i < tw * th; i++)
+		if (mark[i])
+			tiles[count++] = i;
+	static int cores;
+	if (!cores) {
+		cores = sysconf(_SC_NPROCESSORS_ONLN);
+		cores = cores < 1 ? 1 : cores > MAXJOBS ? MAXJOBS : cores;
+	}
+	int njobs = count / MINRUN < cores ? count / MINRUN : cores;
+	if (njobs < 2) {
+		job j = {cur, stride, w, h, tw, progressive, tiles, count, *o};
+		run_job(&j);
+		*o = j.out;
+		free(tiles);
+		return;
+	}
+	job jobs[MAXJOBS];
+	pthread_t th_id[MAXJOBS];
+	int started[MAXJOBS] = {0};
+	for (int k = 0, start = 0; k < njobs; k++) {
+		int end = count * (k + 1) / njobs;
+		jobs[k] = (job){cur, stride, w, h, tw, progressive, tiles + start, end - start, {0}};
+		b_init(&jobs[k].out, (end - start) * 1024);
+		start = end;
+	}
+	/* this thread takes the first run, and any a thread couldn't */
+	for (int k = 1; k < njobs; k++)
+		started[k] = !pthread_create(&th_id[k], NULL, run_job, &jobs[k]);
+	for (int k = 0; k < njobs; k++)
+		if (!started[k])
+			run_job(&jobs[k]);
+	for (int k = 0; k < njobs; k++) {
+		if (started[k])
+			pthread_join(th_id[k], NULL);
+		w_bytes(o, jobs[k].out.p, jobs[k].out.len);
+		b_free(&jobs[k].out);
+	}
+	free(tiles);
 }
 
 /* The tiles rects touch, marked in a tw x th grid; their count. */
@@ -293,10 +361,7 @@ void rfx_progressive(buf *o, const uint8_t *cur, int stride, int w, int h, const
 	for (int i = 0; i < 10; i += 2)
 		w_u8(o, quant[i] | quant[i + 1] << 4);
 	size_t tiles_at = o->len;
-	for (int y = 0; y < th; y++)
-		for (int x = 0; x < tw; x++)
-			if (mark[y * tw + x])
-				encode_tile(o, cur, stride, w, h, x, y, 1);
+	encode_tiles(o, cur, stride, w, h, mark, tw, th, 1);
 	free(mark);
 	put_u32(o, size_at, o->len - tiles_at);
 	put_u32(o, at + 2, o->len - at);
@@ -392,10 +457,7 @@ static void rfx_frame(buf *o, const uint8_t *cur, int stride, int w, int h, cons
 	for (int i = 0; i < 10; i += 2)
 		w_u8(o, quant[i] | quant[i + 1] << 4);
 	size_t tiles_at = o->len;
-	for (int y = 0; y < th; y++)
-		for (int x = 0; x < tw; x++)
-			if (mark[y * tw + x])
-				encode_tile(o, cur, stride, w, h, x, y, 0);
+	encode_tiles(o, cur, stride, w, h, mark, tw, th, 0);
 	free(mark);
 	put_u16(o, count_at, count);
 	put_u32(o, count_at + 2, o->len - tiles_at);
