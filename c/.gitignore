@@ -1,0 +1,4 @@
+*.o
+rdesk-rdpc
+rdesk-rdpc-client
+*.ppm
