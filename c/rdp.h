@@ -65,6 +65,8 @@ size_t r_per_len(buf *b);
 /* TPKT + X.224 data + MCS send data (request if from client) */
 int send_mcs(conn *c, int indication, uint16_t user, uint16_t chan,
 	     const uint8_t *p, size_t n);
+/* The same PDU appended to b, unsent. */
+void mcs_put(buf *b, int indication, uint16_t user, uint16_t chan, const uint8_t *p, size_t n);
 /* Parse TPKT+X224 data+MCS domain PDU header. Returns MCS type (choice>>2),
  * fills user/chan for send-data PDUs and leaves b->pos at the payload. */
 int parse_mcs(buf *b, uint16_t *user, uint16_t *chan);
@@ -190,5 +192,7 @@ int evdev_to_sc(int ev, int *ext);
 /* Static virtual channel: send one PDU in 1600-byte chunks; reassemble
  * chunks into acc, returning 1 when a whole PDU is in acc. */
 int vc_send(conn *c, int indication, uint16_t user, uint16_t chan, const uint8_t *p, size_t n);
+/* The same, appended to out (server to client), unsent. */
+void vc_put(buf *out, uint16_t user, uint16_t chan, const uint8_t *p, size_t n);
 int vc_recv(buf *acc, buf *b);
 void fp_update(buf *out, uint8_t code, const uint8_t *p, size_t n);

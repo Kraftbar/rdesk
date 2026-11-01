@@ -444,24 +444,30 @@ size_t r_per_len(buf *b)
 
 /* ---- MCS ------------------------------------------------------------ */
 
+void mcs_put(buf *b, int indication, uint16_t user, uint16_t chan, const uint8_t *p, size_t n)
+{
+	size_t at = b->len;
+	w_u8(b, 3);
+	w_u8(b, 0);
+	w_u16be(b, 0); /* patched */
+	w_u8(b, 2);
+	w_u8(b, 0xf0);
+	w_u8(b, 0x80);
+	w_u8(b, (indication ? MCS_SDIN : MCS_SDRQ) << 2);
+	w_u16be(b, user - 1001);
+	w_u16be(b, chan);
+	w_u8(b, 0x70);
+	w_per_len(b, n);
+	w_bytes(b, p, n);
+	put_u16be(b, at + 2, b->len - at);
+}
+
 int send_mcs(conn *c, int indication, uint16_t user, uint16_t chan,
 	     const uint8_t *p, size_t n)
 {
 	buf b;
 	b_init(&b, n + 20);
-	w_u8(&b, 3);
-	w_u8(&b, 0);
-	w_u16be(&b, 0); /* patched */
-	w_u8(&b, 2);
-	w_u8(&b, 0xf0);
-	w_u8(&b, 0x80);
-	w_u8(&b, (indication ? MCS_SDIN : MCS_SDRQ) << 2);
-	w_u16be(&b, user - 1001);
-	w_u16be(&b, chan);
-	w_u8(&b, 0x70);
-	w_per_len(&b, n);
-	w_bytes(&b, p, n);
-	put_u16be(&b, 2, b.len);
+	mcs_put(&b, indication, user, chan, p, n);
 	hexdump("-> mcs", b.p, b.len);
 	int r = c_write(c, b.p, b.len);
 	b_free(&b);
@@ -618,6 +624,23 @@ int vc_send(conn *c, int indication, uint16_t user, uint16_t chan, const uint8_t
 		off += k;
 	} while (off < n);
 	return 0;
+}
+
+void vc_put(buf *out, uint16_t user, uint16_t chan, const uint8_t *p, size_t n)
+{
+	uint8_t chunk[CHANNEL_CHUNK + 8];
+	size_t off = 0;
+	do {
+		size_t k = n - off > CHANNEL_CHUNK ? CHANNEL_CHUNK : n - off;
+		uint32_t flags = (off == 0 ? CHANNEL_FLAG_FIRST : 0) | (off + k == n ? CHANNEL_FLAG_LAST : 0) | 0x10;
+		for (int i = 0; i < 4; i++) {
+			chunk[i] = n >> 8 * i;
+			chunk[4 + i] = flags >> 8 * i;
+		}
+		memcpy(chunk + 8, p + off, k);
+		mcs_put(out, 1, user, chan, chunk, k + 8);
+		off += k;
+	} while (off < n);
 }
 
 int vc_recv(buf *acc, buf *b)

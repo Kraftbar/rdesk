@@ -10,6 +10,7 @@
 #include "nla.h"
 #include "clip.h"
 #include "planar.h"
+#include "gfx.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -21,6 +22,7 @@
 #include <X11/extensions/Xdamage.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <linux/sockios.h>
 #include <netinet/in.h>
@@ -586,6 +588,12 @@ typedef struct {
 	uint16_t cliprdr;       /* channel id, 0 if not offered */
 	buf cliprdr_acc;
 	clip *clip;
+	uint16_t early;         /* GCC early capability flags */
+	uint16_t drdynvc;       /* dynamic channels' channel id, 0 if not offered */
+	buf drdynvc_acc;
+	gfx *gfx;               /* graphics pipeline: being set up, or */
+	int gfx_live;           /* frames go there, as H.264 */
+	int64_t gfx_since;
 } client;
 
 static int clip_send(void *arg, const uint8_t *p, size_t n)
@@ -703,6 +711,7 @@ static int parse_gcc_client(client *cl, buf *b)
 			uint16_t high = r_u16(&blk), supported = r_u16(&blk), early = r_u16(&blk);
 			msg("client '%s' %ux%u highColor %u supported 0x%x early 0x%x version 0x%x build %u", name,
 			    cl->cw, cl->ch, high, supported, early, ver, build);
+			cl->early = early;
 			if (!blk.err && !(early & 0x0002))
 				msg("warning: client does not ask for a 32 bpp session");
 			/* product id, connection type, pad, selected protocol, then
@@ -727,6 +736,8 @@ static int parse_gcc_client(client *cl, buf *b)
 				dbg("static channel %d: %s", 1004 + cl->nchan, cl->chan_name[cl->nchan]);
 				if (!strcmp(cl->chan_name[cl->nchan], "cliprdr"))
 					cl->cliprdr = 1004 + cl->nchan;
+				if (!strcmp(cl->chan_name[cl->nchan], "drdynvc"))
+					cl->drdynvc = 1004 + cl->nchan;
 				cl->nchan++;
 			}
 		}
@@ -816,6 +827,13 @@ static int mcs_connect(client *cl, buf *b)
 	b_free(&gcc);
 	b_free(&sd);
 	return r;
+}
+
+static int dvc_send(void *arg, const uint8_t *p, size_t n)
+{
+	client *cl = arg;
+	vc_put(&out, cl->s.user, cl->drdynvc, p, n);
+	return 0;
 }
 
 static int send_raw_mcs(client *cl, const uint8_t *p, size_t n)
@@ -1370,8 +1388,12 @@ static void send_moves(client *cl)
 	}
 }
 
+static gfx_rect *grects;
+static int ngrects, grects_cap;
+
 /* Send what changed in the dirty tiles of cur against prev (the client's
- * screen): per tile, a bitmap update of the changed pixels' bounding box. */
+ * screen): per tile, a bitmap update of the changed pixels' bounding box,
+ * or with the graphics pipeline, that box in one H.264 frame. */
 static int send_tiles(client *cl, const uint8_t *cur, uint8_t *prev, int stride, int sw, int sh, uint8_t *dirty,
 		      int tw)
 {
@@ -1407,9 +1429,17 @@ static int send_tiles(client *cl, const uint8_t *cur, uint8_t *prev, int stride,
 			}
 			if (r1 < 0)
 				continue;
-			queue_tile(cur, stride, tx + c0, ty + r0, c1 - c0 + 1, r1 - r0 + 1);
 			tiles++;
 			px += (c1 - c0 + 1) * (r1 - r0 + 1);
+			if (cl->gfx_live) {
+				if (ngrects == grects_cap) {
+					grects_cap = grects_cap ? grects_cap * 2 : 256;
+					grects = realloc(grects, grects_cap * sizeof *grects);
+				}
+				grects[ngrects++] = (gfx_rect){tx + c0, ty + r0, c1 - c0 + 1, r1 - r0 + 1};
+				continue;
+			}
+			queue_tile(cur, stride, tx + c0, ty + r0, c1 - c0 + 1, r1 - r0 + 1);
 			if (out.len > 256 * 1024) {
 				int sz;
 				if (flush_out(cl))
@@ -1419,6 +1449,12 @@ static int send_tiles(client *cl, const uint8_t *cur, uint8_t *prev, int stride,
 					return 0;
 			}
 		}
+	}
+	if (cl->gfx_live) {
+		int r = gfx_frame(cl->gfx, cur, stride, grects, ngrects, cl->full);
+		ngrects = 0;
+		if (r)
+			return -1;
 	}
 	cl->full = 0;
 	if (tiles)
@@ -1524,11 +1560,24 @@ static void view_setup(client *cl)
 	msg("desktop %dx%d: screen scaled by %.2f to %dx%d at +%d+%d", v.w, v.h, v.s, v.iw, v.ih, v.ox, v.oy);
 }
 
+static int64_t now_ms(void);
+
 static int send_frame(client *cl)
 {
 	int sz;
 	if (ioctl(cl->c.fd, SIOCOUTQ, &sz) == 0 && sz > OUTQ_MAX)
 		return 0; /* link is behind: drop this frame */
+	if (cl->gfx && !cl->gfx_live) {
+		int st = gfx_state(cl->gfx);
+		if (st == GFX_PENDING && now_ms() - cl->gfx_since < 3000)
+			return 0; /* a blank moment rather than bitmaps the pipeline paints over */
+		msg("gfx: %s, bitmaps instead", st == GFX_PENDING ? "no answer" : "not to be had");
+		gfx_free(cl->gfx);
+		cl->gfx = NULL;
+		cl->full = 1;
+	}
+	if (cl->gfx_live && !gfx_can_send(cl->gfx))
+		return 0; /* the client is still decoding */
 	collect_damage();
 	send_moves(cl);
 	if (cl->full)
@@ -1692,6 +1741,18 @@ static int handle_slowpath(client *cl, buf *b, int *active)
 				return clip_recv(cl->clip, &cl->cliprdr_acc);
 			return 0;
 		}
+		if (chan == cl->drdynvc && cl->gfx) {
+			if (!vc_recv(&cl->drdynvc_acc, b))
+				return 0;
+			if (gfx_recv(cl->gfx, &cl->drdynvc_acc))
+				return -1;
+			if (!cl->gfx_live && gfx_state(cl->gfx) == GFX_READY) {
+				cl->gfx_live = 1;
+				cl->full = 1;
+				cl->scrblt = 0; /* the surface takes no orders */
+			}
+			return flush_out(cl);
+		}
 		dbg("%zu bytes on channel %u ignored", r_left(b), chan);
 		return 0;
 	}
@@ -1728,6 +1789,17 @@ static int handle_slowpath(client *cl, buf *b, int *active)
 				return -1;
 		}
 		view_setup(cl);
+		if (cl->drdynvc && (cl->early & 0x100) && !off("gfx")) {
+			int gw = v.on ? v.w : x.w, gh = v.on ? v.h : x.h;
+			if ((gw | gh) & 1) {
+				msg("gfx: %dx%d is odd, bitmaps instead", gw, gh);
+			} else {
+				cl->gfx = gfx_new(dvc_send, cl, gw, gh);
+				cl->gfx_since = now_ms();
+				if (gfx_start(cl->gfx) || flush_out(cl))
+					return -1;
+			}
+		}
 		msg("session active, %dx%d", x.w, x.h);
 		return 0;
 	case PDU2_INPUT:
@@ -1757,7 +1829,8 @@ static int handle_slowpath(client *cl, buf *b, int *active)
 
 /* A client that asks for much less than the screen (a phone) gets a
  * desktop of its own instead of the screen squeezed into it: an Xvfb at
- * its size running nwm. It outlives the session, and the server too (its
+ * its size running nwm, a terminal and Firefox (its own profile, which
+ * reopens its tabs). It outlives the session, and the server too (its
  * display is noted in the cert dir), so the phone comes back to what it
  * left, like a Windows session. ~/.config/rdesk/phone-session, if
  * executable, runs instead of nwm and a terminal. RDESK_OFF=phone scales
@@ -1811,10 +1884,14 @@ static int phone_alive(void)
 }
 
 /* Children of ours that live on: none of our descriptors (the client's
- * socket would stay open) and their own session. */
+ * socket would stay open), their own session, and their own log. */
 static void detach(void)
 {
 	setsid();
+	int null = open("/dev/null", O_RDONLY), log = open("/tmp/rdesk-phone.log", O_WRONLY | O_CREAT | O_APPEND, 0600);
+	dup2(null, 0);
+	dup2(log < 0 ? null : log, 1);
+	dup2(log < 0 ? null : log, 2);
 	for (int fd = 3; fd < 1024; fd++)
 		close(fd);
 }
@@ -1836,8 +1913,8 @@ static int phone_start(const client *cl)
 			break;
 	}
 	snprintf(ph.name, sizeof ph.name, ":%d", ph.num);
-	ph.w = cl->cw;
-	ph.h = cl->ch;
+	ph.w = cl->cw & ~1; /* even, for H.264 */
+	ph.h = cl->ch & ~1;
 
 	/* a fresh cookie, for any host (FamilyWild) on this display number */
 	uint8_t cookie[16];
@@ -1893,7 +1970,7 @@ static int phone_start(const client *cl)
 	}
 
 	/* Firefox on the desk holds the profile and would take the phone's
-	 * windows: the phone's runs its own */
+	 * windows: the phone's runs its own, and comes back with its tabs */
 	char bin[640];
 	snprintf(bin, sizeof bin, "%s/phone-bin", opt.certdir);
 	mkdir(bin, 0700);
@@ -1903,6 +1980,8 @@ static int phone_start(const client *cl)
 		      "# Firefox on the phone desktop (rdesk-rdpc): the desk's has the default profile\n"
 		      "p=\"$HOME/.mozilla/rdesk-phone\"\n"
 		      "mkdir -p \"$p\"\n"
+		      "# open the tabs it had\n"
+		      "[ -f \"$p/user.js\" ] || echo 'user_pref(\"browser.startup.page\", 3);' > \"$p/user.js\"\n"
 		      "exec /usr/bin/firefox --no-remote --profile \"$p\" \"$@\"\n",
 		      f);
 		fclose(f);
@@ -1920,7 +1999,7 @@ static int phone_start(const client *cl)
 			 "cd; echo 'Xft.dpi: %d' | xrdb -merge; export PATH='%s/phone-bin':\"$PATH\"; "
 			 "unset DBUS_SESSION_BUS_ADDRESS SESSION_MANAGER; f='%s/phone-session'; "
 			 "[ -x \"$f\" ] && exec dbus-run-session \"$f\"; "
-			 "exec dbus-run-session sh -c 'xfce4-terminal --disable-server --maximize & exec nwm -n'",
+			 "exec dbus-run-session sh -c 'xfce4-terminal --disable-server --maximize & firefox & exec nwm -n'",
 			 dpi, opt.certdir, opt.certdir);
 		setenv("DISPLAY", ph.name, 1);
 		setenv("XAUTHORITY", phone_auth, 1);
@@ -1947,7 +2026,7 @@ static const char *phone_open(const client *cl)
 	}
 	if (!phone_alive()) {
 		ph.pid = 0;
-	} else if (ph.w != cl->cw || ph.h != cl->ch) {
+	} else if (ph.w != (cl->cw & ~1) || ph.h != (cl->ch & ~1)) {
 		msg("phone desktop %s is %dx%d, client wants %ux%u: starting it over", ph.name, ph.w, ph.h, cl->cw,
 		    cl->ch);
 		kill(ph.pid, SIGTERM);
@@ -1987,6 +2066,7 @@ static void serve(int fd, SSL_CTX *ctx)
 	buf b;
 	b_init(&b, 65536);
 	b_init(&cl.cliprdr_acc, 4096);
+	b_init(&cl.drdynvc_acc, 4096);
 	int active = 0;
 
 	if (x224_connect(&cl, &b))
@@ -2086,6 +2166,8 @@ done:
 	b_free(&b);
 	clip_free(cl.clip);
 	b_free(&cl.cliprdr_acc);
+	b_free(&cl.drdynvc_acc);
+	gfx_free(cl.gfx);
 	x_switch(NULL); /* idle on the real screen: the phone's may be started over */
 	msg("session ended");
 }
