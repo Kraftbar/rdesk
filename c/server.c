@@ -7,6 +7,7 @@
 #include "rdp.h"
 #include "nla.h"
 #include "clip.h"
+#include "planar.h"
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -58,6 +59,13 @@ static struct {
 } opt = {"0.0.0.0", 3390, 30, NULL, "", 0};
 
 static char nthash_path[600];
+
+/* RDESK_OFF=clip,cursor,frames: switch parts off (diagnostics). */
+static int off(const char *what)
+{
+	const char *e = getenv("RDESK_OFF");
+	return e && strstr(e, what);
+}
 
 /* NT hash for NLA: --pass, else the stored one. 0 when available. */
 static int get_nthash(uint8_t h[16])
@@ -847,33 +855,48 @@ static int mcs_domain(client *cl, buf *b)
 
 /* ---- updates --------------------------------------------------------- */
 
+/* One tile as a bitmap update: planar with the compression header (like
+ * Windows), or raw with RDESK_RAW=1. Width padded to 4. */
 static void queue_tile(int tx, int ty, int w, int h)
 {
+	static uint8_t tile[TILE * TILE * 4], enc[planar_max(TILE, TILE) + 16];
+	static buf u;
+	static int raw = -1;
+	if (raw < 0)
+		raw = getenv("RDESK_RAW") && *getenv("RDESK_RAW") == '1';
 	int w4 = (w + 3) & ~3;
-	size_t bytes = (size_t)w4 * h * 4;
-	size_t upd = 4 + 18 + bytes;
-	fp_header(&out, 0, 3 + upd);
-	w_u8(&out, FP_UPD_BITMAP);
-	w_u16(&out, upd);
-	w_u16(&out, 1); /* UPDATETYPE_BITMAP */
-	w_u16(&out, 1);
-	w_u16(&out, tx);
-	w_u16(&out, ty);
-	w_u16(&out, tx + w - 1);
-	w_u16(&out, ty + h - 1);
-	w_u16(&out, w4);
-	w_u16(&out, h);
-	w_u16(&out, 32);
-	w_u16(&out, 0);
-	w_u16(&out, bytes);
-	b_reserve(&out, bytes);
 	int stride = x.img->bytes_per_line;
-	for (int r = h - 1; r >= 0; r--) {
-		const uint8_t *src = (uint8_t *)x.img->data + (size_t)(ty + r) * stride + tx * 4;
-		memcpy(out.p + out.len, src, w * 4);
-		memset(out.p + out.len + w * 4, 0, (w4 - w) * 4);
-		out.len += w4 * 4;
+	for (int r = 0; r < h; r++) {
+		/* raw bitmaps are bottom-up */
+		uint8_t *dst = tile + (raw ? h - 1 - r : r) * w4 * 4;
+		memcpy(dst, x.img->data + (size_t)(ty + r) * stride + tx * 4, w * 4);
+		memset(dst + w * 4, 0, (w4 - w) * 4);
 	}
+	b_reset(&u);
+	w_u16(&u, 1); /* UPDATETYPE_BITMAP */
+	w_u16(&u, 1);
+	w_u16(&u, tx);
+	w_u16(&u, ty);
+	w_u16(&u, tx + w - 1);
+	w_u16(&u, ty + h - 1);
+	w_u16(&u, w4);
+	w_u16(&u, h);
+	w_u16(&u, 32);
+	if (raw) {
+		w_u16(&u, 0);
+		w_u16(&u, w4 * h * 4);
+		w_bytes(&u, tile, w4 * h * 4);
+	} else {
+		size_t n = planar_encode(tile, w4 * 4, w4, h, 1, enc);
+		w_u16(&u, 0x0001); /* BITMAP_COMPRESSION */
+		w_u16(&u, 8 + n);
+		w_u16(&u, 0);                         /* cbCompFirstRowSize */
+		w_u16(&u, n);                         /* cbCompMainBodySize */
+		w_u16(&u, w4 * 4);                    /* cbScanWidth: bytes, not pixels */
+		w_u16(&u, w4 * h * 4);                /* cbUncompressedSize */
+		w_bytes(&u, enc, n);
+	}
+	fp_update(&out, FP_UPD_BITMAP, u.p, u.len);
 }
 
 static int send_frame(client *cl)
@@ -919,20 +942,17 @@ static int send_cursor(client *cl)
 	int w = ci->width > MAX_POINTER ? MAX_POINTER : ci->width;
 	int h = ci->height > MAX_POINTER ? MAX_POINTER : ci->height;
 	int hx = ci->xhot < w ? ci->xhot : w - 1, hy = ci->yhot < h ? ci->yhot : h - 1;
-	int andstride = ((w + 15) / 16) * 2;
-	size_t xorlen = (size_t)w * h * 4, andlen = (size_t)andstride * h;
-	size_t upd = 2 + 14 + xorlen + andlen;
-	fp_header(&out, 0, 3 + upd);
-	w_u8(&out, FP_UPD_POINTER);
-	w_u16(&out, upd);
-	w_u16(&out, 32); /* xorBpp */
-	w_u16(&out, 0);  /* cache index */
-	w_u16(&out, hx);
-	w_u16(&out, hy);
-	w_u16(&out, w);
-	w_u16(&out, h);
-	w_u16(&out, andlen);
-	w_u16(&out, xorlen);
+	size_t xorlen = (size_t)w * h * 4, andlen = 0; /* alpha cursor: no AND mask */
+	static buf u;
+	b_reset(&u);
+	w_u16(&u, 32); /* xorBpp */
+	w_u16(&u, 0);  /* cache index */
+	w_u16(&u, hx);
+	w_u16(&u, hy);
+	w_u16(&u, w);
+	w_u16(&u, h);
+	w_u16(&u, andlen);
+	w_u16(&u, xorlen);
 	for (int r = h - 1; r >= 0; r--) {
 		for (int c = 0; c < w; c++) {
 			unsigned long px = ci->pixels[r * ci->width + c];
@@ -942,14 +962,14 @@ static int send_cursor(client *cl)
 				g = g * 255 / a;
 				bb = bb * 255 / a;
 			}
-			w_u8(&out, bb);
-			w_u8(&out, g);
-			w_u8(&out, rr);
-			w_u8(&out, a);
+			w_u8(&u, bb);
+			w_u8(&u, g);
+			w_u8(&u, rr);
+			w_u8(&u, a);
 		}
 	}
-	w_zero(&out, andlen);
 	XFree(ci);
+	fp_update(&out, FP_UPD_POINTER, u.p, u.len);
 	cl->cursor_dirty = 0;
 	return flush_out(cl);
 }
@@ -1079,7 +1099,7 @@ static int handle_slowpath(client *cl, buf *b, int *active)
 		*active = 1;
 		cl->full = 1;
 		cl->cursor_dirty = 1;
-		if (cl->cliprdr && !cl->clip) {
+		if (cl->cliprdr && !cl->clip && !off("clip")) {
 			cl->clip = clip_new(x.dpy, 1, clip_send, cl);
 			if (clip_start(cl->clip))
 				return -1;
@@ -1171,9 +1191,9 @@ static void serve(int fd, SSL_CTX *ctx)
 			next += 1000 / opt.fps;
 			if (next < t)
 				next = t + 1000 / opt.fps;
-			if (cl.cursor_dirty && send_cursor(&cl))
+			if (cl.cursor_dirty && !off("cursor") && send_cursor(&cl))
 				break;
-			if (!cl.suppress && send_frame(&cl))
+			if (!cl.suppress && !off("frames") && send_frame(&cl))
 				break;
 		}
 		if (c_pending(&cl.c) == 0) {

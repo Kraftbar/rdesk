@@ -604,7 +604,8 @@ int vc_send(conn *c, int indication, uint16_t user, uint16_t chan, const uint8_t
 	size_t off = 0;
 	do {
 		size_t k = n - off > CHANNEL_CHUNK ? CHANNEL_CHUNK : n - off;
-		uint32_t flags = (off == 0 ? CHANNEL_FLAG_FIRST : 0) | (off + k == n ? CHANNEL_FLAG_LAST : 0);
+		uint32_t flags = (off == 0 ? CHANNEL_FLAG_FIRST : 0) | (off + k == n ? CHANNEL_FLAG_LAST : 0) |
+				 0x10; /* SHOW_PROTOCOL: required for cliprdr */
 		buf b;
 		b_init(&b, k + 8);
 		w_u32(&b, n);
@@ -635,4 +636,23 @@ int vc_recv(buf *acc, buf *b)
 	if (acc->len != total)
 		dbg("channel PDU %zu bytes, header says %u", acc->len, total);
 	return 1;
+}
+
+/* One fast-path update, fragmented so no PDU exceeds 0x3FFF bytes
+ * (FreeRDP's FASTPATH_MAX_PACKET_SIZE; mstsc rejects bigger ones). */
+void fp_update(buf *out, uint8_t code, const uint8_t *p, size_t n)
+{
+	const size_t max = 0x3fff - 6;
+	size_t off = 0;
+	do {
+		size_t k = n - off > max ? max : n - off;
+		int frag = n <= max ? FP_FRAG_SINGLE
+			   : off == 0 ? FP_FRAG_FIRST
+			   : off + k == n ? FP_FRAG_LAST : FP_FRAG_NEXT;
+		fp_header(out, 0, 3 + k);
+		w_u8(out, code | frag << 4);
+		w_u16(out, k);
+		w_bytes(out, p + off, k);
+		off += k;
+	} while (off < n);
 }

@@ -190,3 +190,4 @@ int evdev_to_sc(int ev, int *ext);
  * chunks into acc, returning 1 when a whole PDU is in acc. */
 int vc_send(conn *c, int indication, uint16_t user, uint16_t chan, const uint8_t *p, size_t n);
 int vc_recv(buf *acc, buf *b);
+void fp_update(buf *out, uint8_t code, const uint8_t *p, size_t n);

@@ -786,7 +786,7 @@ static void pointer_update(int code, buf *b)
 		XDefineCursor(x.dpy, x.win, c);
 }
 
-static void fp_update(rdp *r, int code, buf *b)
+static void on_fp_update(rdp *r, int code, buf *b)
 {
 	(void)r;
 	switch (code) {
@@ -821,7 +821,7 @@ static void fastpath(rdp *r, buf *b)
 			return;
 		if (frag == FP_FRAG_SINGLE) {
 			buf u = {.p = (uint8_t *)p, .len = size};
-			fp_update(r, code, &u);
+			on_fp_update(r, code, &u);
 		} else {
 			if (frag == FP_FRAG_FIRST) {
 				b_reset(&r->frag);
@@ -830,7 +830,7 @@ static void fastpath(rdp *r, buf *b)
 			w_bytes(&r->frag, p, size);
 			if (frag == FP_FRAG_LAST) {
 				r->frag.pos = 0;
-				fp_update(r, r->frag_code, &r->frag);
+				on_fp_update(r, r->frag_code, &r->frag);
 				b_reset(&r->frag);
 			}
 		}

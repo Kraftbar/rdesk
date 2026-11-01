@@ -116,3 +116,85 @@ out:
 		free(pl[k]);
 	return rc;
 }
+
+/* ---- encoder --------------------------------------------------------- */
+
+static void seg(uint8_t **o, const uint8_t *raw, int k, int run)
+{
+	*(*o)++ = k << 4 | run;
+	memcpy(*o, raw, k);
+	*o += k;
+}
+
+/* One scanline of symbols (raw values on the first line, delta codes after)
+ * as RLE segments. A run repeats the previous symbol, 0 at line start. */
+static void rle_line(const uint8_t *v, int w, uint8_t **o)
+{
+	uint8_t raw[15];
+	int k = 0, last = 0, i = 0;
+	while (i < w) {
+		int r = 0;
+		while (i + r < w && v[i + r] == last)
+			r++;
+		if (r >= 3) {
+			int first = r > 15 ? 15 : r;
+			seg(o, raw, k, first);
+			k = 0;
+			int rest = r - first;
+			while (rest >= 3) {
+				int n;
+				if (rest >= 32) {
+					n = rest - 32 > 15 ? 47 : rest;
+					*(*o)++ = (n - 32) << 4 | 2;
+				} else if (rest >= 16) {
+					n = rest;
+					*(*o)++ = (n - 16) << 4 | 1;
+				} else {
+					n = rest;
+					*(*o)++ = n;
+				}
+				rest -= n;
+			}
+			i += r - rest; /* 1 or 2 leftovers go out as raw */
+			continue;
+		}
+		raw[k++] = v[i];
+		last = v[i];
+		i++;
+		if (k == 15) {
+			seg(o, raw, k, 0);
+			k = 0;
+		}
+	}
+	if (k)
+		seg(o, raw, k, 0);
+}
+
+size_t planar_encode(const uint8_t *src, int stride, int w, int h, int vflip, uint8_t *out)
+{
+	uint8_t *o = out, *cur = malloc(w), *prev = malloc(w), *sym = malloc(w);
+	*o++ = 0x30; /* RLE | no alpha, no color loss */
+	for (int plane = 2; plane >= 0; plane--) { /* R, G, B = bytes 2, 1, 0 of BGRX */
+		for (int y = 0; y < h; y++) {
+			const uint8_t *row = src + (size_t)(vflip ? h - 1 - y : y) * stride;
+			for (int x = 0; x < w; x++)
+				cur[x] = row[x * 4 + plane];
+			if (!y) {
+				memcpy(sym, cur, w);
+			} else {
+				for (int x = 0; x < w; x++) {
+					int d = (int8_t)(cur[x] - prev[x]);
+					sym[x] = d >= 0 ? 2 * d : 2 * -d - 1;
+				}
+			}
+			rle_line(sym, w, &o);
+			uint8_t *t = prev;
+			prev = cur;
+			cur = t;
+		}
+	}
+	free(cur);
+	free(prev);
+	free(sym);
+	return o - out;
+}
