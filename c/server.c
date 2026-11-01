@@ -383,8 +383,30 @@ static void click(int button, int n)
 	}
 }
 
+/* A client that asked for a smaller desktop than the screen gets the
+ * screen scaled to fit, letterboxed, and its pointer mapped back. */
+static struct {
+	int on, w, h;        /* client desktop */
+	int ox, oy, iw, ih;  /* where the scaled image sits in it */
+	double s;
+	uint8_t *buf, *prev; /* client desktop pixels, stride w * 4 */
+	uint8_t *dirty;      /* per tile of the client desktop */
+	int tw, th;
+	int *xi, *xf, *yi, *yf; /* per image column/row: source pixel, weight of the next (0..256) */
+} v;
+
+static void map_pointer(uint16_t *mx, uint16_t *my)
+{
+	if (!v.on)
+		return;
+	int px = (int)((*mx - v.ox + 0.5) / v.s), py = (int)((*my - v.oy + 0.5) / v.s);
+	*mx = px < 0 ? 0 : px >= x.w ? x.w - 1 : px;
+	*my = py < 0 ? 0 : py >= x.h ? x.h - 1 : py;
+}
+
 static void in_mouse(uint16_t f, uint16_t mx, uint16_t my)
 {
+	map_pointer(&mx, &my);
 	if (f & (PTR_WHEEL | PTR_HWHEEL)) {
 		int rot = f & 0xff;
 		if (f & PTR_WHEEL_NEG)
@@ -409,6 +431,7 @@ static void in_mouse(uint16_t f, uint16_t mx, uint16_t my)
 
 static void in_mousex(uint16_t f, uint16_t mx, uint16_t my)
 {
+	map_pointer(&mx, &my);
 	XTestFakeMotionEvent(x.dpy, -1, mx, my, 0);
 	int down = !!(f & PTRX_DOWN);
 	if (f & PTRX_BUTTON1)
@@ -531,6 +554,7 @@ typedef struct {
 	int cursor_dirty;
 	char username[256];
 	int scrblt;             /* client takes ScrBlt orders */
+	int dw, dh;             /* desktop size announced in demand active */
 	uint16_t cliprdr;       /* channel id, 0 if not offered */
 	buf cliprdr_acc;
 	clip *clip;
@@ -792,10 +816,22 @@ static int send_demand_active(client *cl)
 	w_u8(&caps, 1); w_u8(&caps, 1);
 	ncaps++;
 
-	/* bitmap */
+	/* bitmap. A client that asked for less than the screen in either
+	 * direction gets its size and the screen scaled into it: the iOS app
+	 * keeps the size it asked for whatever is announced, and mstsc reports
+	 * its own size back either way, so this can't wait for confirm active.
+	 * RDESK_DESKTOP=WxH announces that size instead (testing). */
+	cl->dw = x.w;
+	cl->dh = x.h;
+	if (cl->cw && cl->ch && (cl->cw < x.w || cl->ch < x.h)) {
+		cl->dw = cl->cw;
+		cl->dh = cl->ch;
+	}
+	if (getenv("RDESK_DESKTOP"))
+		sscanf(getenv("RDESK_DESKTOP"), "%dx%d", &cl->dw, &cl->dh);
 	w_u16(&caps, CAP_BITMAP); w_u16(&caps, 28);
 	w_u16(&caps, 32); w_u16(&caps, 1); w_u16(&caps, 1); w_u16(&caps, 1);
-	w_u16(&caps, x.w); w_u16(&caps, x.h);
+	w_u16(&caps, cl->dw); w_u16(&caps, cl->dh);
 	w_u16(&caps, 0); w_u16(&caps, 1); w_u16(&caps, 1);
 	w_u8(&caps, 0); w_u8(&caps, 0);
 	w_u16(&caps, 1); w_u16(&caps, 0);
@@ -993,7 +1029,7 @@ static int mcs_domain(client *cl, buf *b)
 
 /* One tile as a bitmap update: planar with the compression header (like
  * Windows), or raw with RDESK_RAW=1. Width padded to 4. */
-static void queue_tile(int tx, int ty, int w, int h)
+static void queue_tile(const uint8_t *src, int stride, int tx, int ty, int w, int h)
 {
 	static uint8_t tile[TILE * TILE * 4], enc[planar_max(TILE, TILE) + 16];
 	static buf u;
@@ -1001,11 +1037,10 @@ static void queue_tile(int tx, int ty, int w, int h)
 	if (raw < 0)
 		raw = getenv("RDESK_RAW") && *getenv("RDESK_RAW") == '1';
 	int w4 = (w + 3) & ~3;
-	int stride = x.img->bytes_per_line;
 	for (int r = 0; r < h; r++) {
 		/* raw bitmaps are bottom-up */
 		uint8_t *dst = tile + (raw ? h - 1 - r : r) * w4 * 4;
-		memcpy(dst, x.img->data + (size_t)(ty + r) * stride + tx * 4, w * 4);
+		memcpy(dst, src + (size_t)(ty + r) * stride + tx * 4, w * 4);
 		memset(dst + w * 4, 0, (w4 - w) * 4);
 	}
 	b_reset(&u);
@@ -1291,6 +1326,154 @@ static void send_moves(client *cl)
 	}
 }
 
+/* Send what changed in the dirty tiles of cur against prev (the client's
+ * screen): per tile, a bitmap update of the changed pixels' bounding box. */
+static int send_tiles(client *cl, const uint8_t *cur, uint8_t *prev, int stride, int sw, int sh, uint8_t *dirty,
+		      int tw)
+{
+	int tiles = 0, px = 0;
+	for (int ty = 0; ty < sh; ty += TILE) {
+		int h = ty + TILE > sh ? sh - ty : TILE;
+		for (int tx = 0; tx < sw; tx += TILE) {
+			int w = tx + TILE > sw ? sw - tx : TILE;
+			uint8_t *d = dirty + ty / TILE * tw + tx / TILE;
+			if (!*d)
+				continue;
+			*d = 0;
+			int r0 = h, r1 = -1, c0 = w, c1 = -1;
+			for (int r = 0; r < h; r++) {
+				size_t o = (size_t)(ty + r) * stride + tx * 4;
+				const uint32_t *a = (const uint32_t *)(cur + o), *p = (uint32_t *)(prev + o);
+				if (!cl->full && !memcmp(a, p, w * 4))
+					continue;
+				if (r0 == h)
+					r0 = r;
+				r1 = r;
+				int c = 0;
+				while (c < c0 && a[c] == p[c] && !cl->full)
+					c++;
+				if (c < c0)
+					c0 = c;
+				c = w - 1;
+				while (c > c1 && a[c] == p[c] && !cl->full)
+					c--;
+				if (c > c1)
+					c1 = c;
+				memcpy(prev + o, cur + o, w * 4);
+			}
+			if (r1 < 0)
+				continue;
+			queue_tile(cur, stride, tx + c0, ty + r0, c1 - c0 + 1, r1 - r0 + 1);
+			tiles++;
+			px += (c1 - c0 + 1) * (r1 - r0 + 1);
+			if (out.len > 256 * 1024 && flush_out(cl))
+				return -1;
+		}
+	}
+	cl->full = 0;
+	if (tiles)
+		dbg("frame: %d tiles, %d px", tiles, px);
+	return flush_out(cl);
+}
+
+/* Bilinear samples of x.img for image pixels a0..a1 x b0..b1 into v.buf. */
+static void view_scale(int a0, int b0, int a1, int b1)
+{
+	int sst = x.img->bytes_per_line;
+	for (int b = b0; b < b1; b++) {
+		const uint8_t *r0 = (uint8_t *)x.img->data + (size_t)v.yi[b] * sst, *r1 = r0 + sst;
+		int fy = v.yf[b];
+		uint8_t *o = v.buf + ((size_t)(v.oy + b) * v.w + v.ox + a0) * 4;
+		for (int a = a0; a < a1; a++, o += 4) {
+			const uint8_t *p = r0 + v.xi[a] * 4, *q = r1 + v.xi[a] * 4;
+			int fx = v.xf[a];
+			for (int c = 0; c < 3; c++) {
+				int top = p[c] * (256 - fx) + p[c + 4] * fx;
+				int bot = q[c] * (256 - fx) + q[c + 4] * fx;
+				o[c] = (top * (256 - fy) + bot * fy + 32768) >> 16;
+			}
+			o[3] = 0;
+		}
+	}
+}
+
+/* Rescale what the dirty screen tiles cover and mark it in v.dirty. */
+static void view_update(void)
+{
+	for (int ty = 0; ty < x.th; ty++) {
+		for (int tx = 0; tx < x.tw; tx++) {
+			uint8_t *d = x.dirty + ty * x.tw + tx;
+			if (!*d)
+				continue;
+			*d = 0;
+			/* bilinear reaches one source pixel past the tile */
+			int a0 = (int)((tx * TILE - 1) * v.s), a1 = (int)(((tx + 1) * TILE + 1) * v.s) + 1;
+			int b0 = (int)((ty * TILE - 1) * v.s), b1 = (int)(((ty + 1) * TILE + 1) * v.s) + 1;
+			a0 = a0 < 0 ? 0 : a0;
+			b0 = b0 < 0 ? 0 : b0;
+			a1 = a1 > v.iw ? v.iw : a1;
+			b1 = b1 > v.ih ? v.ih : b1;
+			if (a0 >= a1 || b0 >= b1)
+				continue;
+			view_scale(a0, b0, a1, b1);
+			int dx0 = (v.ox + a0) / TILE, dx1 = (v.ox + a1 - 1) / TILE;
+			for (int r = (v.oy + b0) / TILE; r <= (v.oy + b1 - 1) / TILE; r++)
+				memset(v.dirty + r * v.tw + dx0, 1, dx1 - dx0 + 1);
+		}
+	}
+}
+
+static void view_axis(int n, int src, int **idx, int **frac)
+{
+	*idx = malloc(n * sizeof **idx);
+	*frac = malloc(n * sizeof **frac);
+	for (int d = 0; d < n; d++) {
+		double p = (d + 0.5) / v.s - 0.5;
+		int i = p < 0 ? 0 : (int)p, f = p < 0 ? 0 : (int)((p - i) * 256);
+		if (i >= src - 1) {
+			i = src - 2;
+			f = 256;
+		}
+		(*idx)[d] = i;
+		(*frac)[d] = f;
+	}
+}
+
+static void view_setup(client *cl)
+{
+	free(v.buf);
+	free(v.prev);
+	free(v.dirty);
+	free(v.xi);
+	free(v.xf);
+	free(v.yi);
+	free(v.yf);
+	memset(&v, 0, sizeof v);
+	if (cl->dw == x.w && cl->dh == x.h)
+		return;
+	v.on = 1;
+	v.w = cl->dw;
+	v.h = cl->dh;
+	double sx = (double)v.w / x.w, sy = (double)v.h / x.h;
+	v.s = sx < sy ? sx : sy;
+	v.iw = (int)(x.w * v.s + 0.5);
+	v.ih = (int)(x.h * v.s + 0.5);
+	v.iw = v.iw > v.w ? v.w : v.iw;
+	v.ih = v.ih > v.h ? v.h : v.ih;
+	v.ox = (v.w - v.iw) / 2;
+	v.oy = (v.h - v.ih) / 2;
+	v.buf = calloc((size_t)v.w * v.h, 4);
+	v.prev = calloc((size_t)v.w * v.h, 4);
+	v.tw = (v.w + TILE - 1) / TILE;
+	v.th = (v.h + TILE - 1) / TILE;
+	v.dirty = malloc(v.tw * v.th);
+	memset(v.dirty, 1, v.tw * v.th);
+	view_axis(v.iw, x.w, &v.xi, &v.xf);
+	view_axis(v.ih, x.h, &v.yi, &v.yf);
+	cl->scrblt = 0; /* scaled copies would not be pixel-exact */
+	msg("desktop %dx%d: screen scaled by %.2f to %dx%d at +%d+%d", v.w, v.h, v.s, v.iw, v.ih, v.ox, v.oy);
+}
+
 static int send_frame(client *cl)
 {
 	int sz;
@@ -1313,52 +1496,15 @@ static int send_frame(client *cl)
 			return -1;
 		r = r1;
 	}
+	if (v.on) {
+		if (cl->full)
+			memset(v.dirty, 1, v.tw * v.th);
+		view_update();
+		return send_tiles(cl, v.buf, v.prev, v.w * 4, v.w, v.h, v.dirty, v.tw);
+	}
 	for (int i = 0; cl->scrblt && !cl->full && i < ndrects; i++)
 		detect_scroll(drects[i]);
-	int stride = x.img->bytes_per_line, tiles = 0, px = 0;
-	for (int ty = 0; ty < x.h; ty += TILE) {
-		int h = ty + TILE > x.h ? x.h - ty : TILE;
-		for (int tx = 0; tx < x.w; tx += TILE) {
-			int w = tx + TILE > x.w ? x.w - tx : TILE;
-			uint8_t *d = x.dirty + ty / TILE * x.tw + tx / TILE;
-			if (!*d)
-				continue;
-			*d = 0;
-			/* bounding box of the changed pixels in this tile */
-			int r0 = h, r1 = -1, c0 = w, c1 = -1;
-			for (int r = 0; r < h; r++) {
-				size_t o = (size_t)(ty + r) * stride + tx * 4;
-				const uint32_t *a = (uint32_t *)(x.img->data + o), *p = (uint32_t *)(x.prev + o);
-				if (!cl->full && !memcmp(a, p, w * 4))
-					continue;
-				if (r0 == h)
-					r0 = r;
-				r1 = r;
-				int c = 0;
-				while (c < c0 && a[c] == p[c] && !cl->full)
-					c++;
-				if (c < c0)
-					c0 = c;
-				c = w - 1;
-				while (c > c1 && a[c] == p[c] && !cl->full)
-					c--;
-				if (c > c1)
-					c1 = c;
-				memcpy(x.prev + o, x.img->data + o, w * 4);
-			}
-			if (r1 < 0)
-				continue;
-			queue_tile(tx + c0, ty + r0, c1 - c0 + 1, r1 - r0 + 1);
-			tiles++;
-			px += (c1 - c0 + 1) * (r1 - r0 + 1);
-			if (out.len > 256 * 1024 && flush_out(cl))
-				return -1;
-		}
-	}
-	cl->full = 0;
-	if (tiles)
-		dbg("frame: %d tiles, %d px", tiles, px);
-	return flush_out(cl);
+	return send_tiles(cl, (uint8_t *)x.img->data, x.prev, x.img->bytes_per_line, x.w, x.h, x.dirty, x.tw);
 }
 
 static int send_cursor(client *cl)
@@ -1531,6 +1677,7 @@ static int handle_slowpath(client *cl, buf *b, int *active)
 			if (clip_start(cl->clip))
 				return -1;
 		}
+		view_setup(cl);
 		msg("session active, %dx%d", x.w, x.h);
 		return 0;
 	case PDU2_INPUT:
