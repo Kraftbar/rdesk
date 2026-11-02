@@ -60,7 +60,12 @@ static struct {
 	int dx0, dy0, dx1, dy1; /* dirty rect, dx1 == 0 when clean */
 	Cursor cache[32];
 	Cursor blank;
+	int resizable;        /* the server resizes the desktop to the window */
+	int want_w, want_h;   /* the window's new size, */
+	int64_t resize_at;    /* asked for once it has settled */
 } x;
+
+static int64_t now_ms(void);
 
 static void dirty(int l, int t, int r, int b)
 {
@@ -122,14 +127,16 @@ static int x_window(int w, int h)
 		snprintf(title, sizeof title, "rdesk - %s", opt.host);
 		XStoreName(x.dpy, x.win, title);
 		XSizeHints *sh = XAllocSizeHints();
-		sh->flags = PMinSize | PMaxSize;
-		sh->min_width = sh->max_width = w;
-		sh->min_height = sh->max_height = h;
+		sh->flags = PMinSize | (x.resizable ? 0 : PMaxSize);
+		sh->min_width = x.resizable ? 200 : w;
+		sh->min_height = x.resizable ? 200 : h;
+		sh->max_width = w;
+		sh->max_height = h;
 		XSetWMNormalHints(x.dpy, x.win, sh);
 		XFree(sh);
 		XSelectInput(x.dpy, x.win, ExposureMask | KeyPressMask | KeyReleaseMask |
 			     ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
-			     FocusChangeMask);
+			     FocusChangeMask | StructureNotifyMask);
 		XSetWMProtocols(x.dpy, x.win, &x.wm_delete, 1);
 		x.gc = XCreateGC(x.dpy, x.win, 0, NULL);
 		static char zero[8];
@@ -1109,6 +1116,13 @@ static int x_events(rdp *r)
 				return -1;
 			break;
 		}
+		case ConfigureNotify:
+			if (x.resizable && (e.xconfigure.width != x.w || e.xconfigure.height != x.h)) {
+				x.want_w = e.xconfigure.width;
+				x.want_h = e.xconfigure.height;
+				x.resize_at = now_ms() + 400; /* once the drag has settled */
+			}
+			break;
 		case ClientMessage:
 			if ((Atom)e.xclient.data.l[0] == x.wm_delete)
 				return -1;
@@ -1233,6 +1247,7 @@ int main(int argc, char **argv)
 	if (r.nchan > CHAN_DRDYNVC && !gfx_off()) {
 		gfxc_ops ops = {&r, dvc_send, gfx_paint, gfx_reset};
 		r.gfx = gfxc_new(&ops);
+		x.resizable = !off("resize");
 	}
 
 	buf b;
@@ -1242,6 +1257,11 @@ int main(int argc, char **argv)
 	for (;;) {
 		if (x.dpy && x_events(&r))
 			break;
+		if (x.resize_at && now_ms() >= x.resize_at) {
+			x.resize_at = 0;
+			if (r.gfx && (x.want_w != x.w || x.want_h != x.h) && gfxc_resize(r.gfx, x.want_w, x.want_h))
+				break;
+		}
 		if (c_pending(&r.c) == 0) {
 			present();
 			struct pollfd p[2] = {{r.c.fd, POLLIN, 0}, {x.dpy ? ConnectionNumber(x.dpy) : -1, POLLIN, 0}};
@@ -1249,6 +1269,10 @@ int main(int argc, char **argv)
 			if (dump_at && to <= 0) {
 				dump_ppm();
 				break;
+			}
+			if (x.resize_at) {
+				int rt = (int)(x.resize_at - now_ms());
+				to = to < 0 || rt < to ? (rt < 0 ? 0 : rt) : to;
 			}
 			if (poll(p, 2, to) < 0 && errno != EINTR)
 				break;

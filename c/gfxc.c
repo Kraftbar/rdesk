@@ -17,6 +17,7 @@
 #include <string.h>
 
 #define GFX_CHANNEL "Microsoft::Windows::RDS::Graphics"
+#define DISP_CHANNEL "Microsoft::Windows::RDS::DisplayControl"
 
 /* DVC commands (high nibble of the header byte) */
 #define DVC_CREATE 0x1
@@ -88,6 +89,9 @@ struct gfxc {
 	gfxc_ops ops;
 	int open; /* the graphics channel is created */
 	uint32_t chan;
+	int disp_open, disp_ready; /* display control: created, caps came */
+	uint32_t disp;
+	int want_w, want_h; /* a size asked for before display control was ready */
 	buf in; /* a DVC message arriving in pieces */
 	size_t in_total;
 	buf out; /* a message decompressed */
@@ -854,6 +858,65 @@ int gfxc_replay(gfxc *g, const uint8_t *p, size_t n)
 	return pdus(g, &b);
 }
 
+/* ---- display control (MS-RDPEDISP) ------------------------------------- */
+
+/* The desktop as w x h: one monitor, primary, 100% scale. */
+static int send_layout(gfxc *g, int w, int h)
+{
+	buf o;
+	b_init(&o, 64);
+	dvc_header(&o, DVC_DATA, g->disp);
+	w_u32(&o, 2); /* MONITOR_LAYOUT */
+	w_u32(&o, 8 + 8 + 40);
+	w_u32(&o, 40);
+	w_u32(&o, 1);
+	w_u32(&o, 1); /* primary */
+	w_u32(&o, 0);
+	w_u32(&o, 0);
+	w_u32(&o, w);
+	w_u32(&o, h);
+	w_u32(&o, 0); /* physical size unknown */
+	w_u32(&o, 0);
+	w_u32(&o, 0); /* landscape */
+	w_u32(&o, 100);
+	w_u32(&o, 100);
+	int r = g->ops.send(g->ops.arg, o.p, o.len);
+	b_free(&o);
+	msg("gfx: asking for a %dx%d desktop", w, h);
+	return r;
+}
+
+static int disp_recv(gfxc *g, buf *b)
+{
+	uint32_t type = r_u32(b);
+	r_u32(b);
+	if (type != 5) /* CAPS */
+		return 0;
+	uint32_t mons = r_u32(b), fa = r_u32(b), fb = r_u32(b);
+	dbg("disp: up to %u monitors, area %ux%u", mons, fa, fb);
+	g->disp_ready = 1;
+	if (g->want_w) {
+		int w = g->want_w, h = g->want_h;
+		g->want_w = 0;
+		return send_layout(g, w, h);
+	}
+	return 0;
+}
+
+int gfxc_resize(gfxc *g, int w, int h)
+{
+	/* even widths, 200 to 8192 each way */
+	w &= ~1;
+	w = w < 200 ? 200 : w > 8192 ? 8192 : w;
+	h = h < 200 ? 200 : h > 8192 ? 8192 : h;
+	if (!g->disp_ready) {
+		g->want_w = w;
+		g->want_h = h;
+		return 0;
+	}
+	return send_layout(g, w, h);
+}
+
 /* ---- dynamic channels ------------------------------------------------- */
 
 static uint32_t r_var(buf *b, int code)
@@ -883,17 +946,22 @@ int gfxc_recv(gfxc *g, buf *b)
 		size_t nl = strnlen((const char *)b->p + b->pos, r_left(b));
 		char name[128];
 		snprintf(name, sizeof name, "%.*s", (int)nl, b->p + b->pos);
-		int ours = !g->open && !strcmp(name, GFX_CHANNEL);
+		int gfx = !g->open && !strcmp(name, GFX_CHANNEL);
+		int disp = !g->disp_open && !strcmp(name, DISP_CHANNEL);
 		buf o;
 		b_init(&o, 16);
 		dvc_header(&o, DVC_CREATE, id);
-		w_u32(&o, ours ? 0 : 0xc0000001);
-		dbg("dvc: channel %u '%s' %s", id, name, ours ? "opened" : "refused");
+		w_u32(&o, gfx || disp ? 0 : 0xc0000001);
+		dbg("dvc: channel %u '%s' %s", id, name, gfx || disp ? "opened" : "refused");
 		int e = g->ops.send(g->ops.arg, o.p, o.len);
 		b_free(&o);
 		if (e)
 			return -1;
-		if (!ours)
+		if (disp) {
+			g->disp_open = 1;
+			g->disp = id;
+		}
+		if (!gfx)
 			return 0;
 		g->open = 1;
 		g->chan = id;
@@ -910,6 +978,8 @@ int gfxc_recv(gfxc *g, buf *b)
 	}
 	case DVC_DATA: {
 		uint32_t id = r_var(b, cb);
+		if (g->disp_open && id == g->disp)
+			return disp_recv(g, b);
 		if (!g->open || id != g->chan)
 			return 0;
 		if (!g->in_total) /* whole */
@@ -923,6 +993,8 @@ int gfxc_recv(gfxc *g, buf *b)
 			msg("gfx: server closed the channel");
 			g->open = 0;
 		}
+		if (g->disp_open && id == g->disp)
+			g->disp_open = g->disp_ready = 0;
 		buf o;
 		b_init(&o, 8);
 		dvc_header(&o, DVC_CLOSE, id);
