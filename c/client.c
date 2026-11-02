@@ -2,9 +2,11 @@
  *
  * Milestone 1: TLS security, slow-path connection sequence, raw bitmap
  * updates (fast-path and slow-path), pointer shapes, fast-path keyboard and
- * mouse input. */
+ * mouse input. The graphics pipeline (gfxc.c) when the server offers it:
+ * H.264 and the rest; RDESK_OFF=gfx for bitmaps only. */
 #define _GNU_SOURCE
 #include "rdp.h"
+#include "gfxc.h"
 #include "nla.h"
 #include "planar.h"
 #include "clip.h"
@@ -172,12 +174,46 @@ typedef struct {
 	int frag_code;
 	buf cliprdr_acc;
 	clip *clip;
+	buf drdynvc_acc;
+	gfxc *gfx;
 } rdp;
+
+/* chan_id[] follows the order of CS_NET */
+#define CHAN_CLIPRDR 0
+#define CHAN_DRDYNVC 1
+
+/* RDESK_OFF=gfx,dvc,conntype: switch parts off (diagnostics) */
+static int off(const char *what)
+{
+	const char *e = getenv("RDESK_OFF");
+	return e && strstr(e, what);
+}
+
+static int gfx_off(void)
+{
+	return off("gfx") || off("dvc");
+}
 
 static int clip_send(void *arg, const uint8_t *p, size_t n)
 {
 	rdp *r = arg;
-	return r->nchan ? vc_send(&r->c, 0, r->s.user, r->chan_id[0], p, n) : -1;
+	return r->nchan > CHAN_CLIPRDR ? vc_send(&r->c, 0, r->s.user, r->chan_id[CHAN_CLIPRDR], p, n) : -1;
+}
+
+static int dvc_send(void *arg, const uint8_t *p, size_t n)
+{
+	/* one chunk (client DVC messages are small), without SHOW_PROTOCOL:
+	 * vc_send sets it, as cliprdr needs, but drdynvc doesn't ask for it */
+	rdp *r = arg;
+	uint8_t pdu[8 + 1600];
+	if (r->nchan <= CHAN_DRDYNVC || n > 1600)
+		return -1;
+	for (int i = 0; i < 4; i++)
+		pdu[i] = n >> 8 * i;
+	pdu[4] = 0x03; /* FIRST | LAST */
+	pdu[5] = pdu[6] = pdu[7] = 0;
+	memcpy(pdu + 8, p, n);
+	return send_mcs(&r->c, 0, r->s.user, r->chan_id[CHAN_DRDYNVC], pdu, n + 8);
 }
 
 static int tcp_connect(const char *host, const char *port)
@@ -309,9 +345,11 @@ static int mcs_connect(rdp *r)
 	w_u32(&ud, 0);
 	w_u16(&ud, 24);
 	w_u16(&ud, 0x000f);
-	w_u16(&ud, 0x0001 | 0x0002); /* SUPPORT_ERRINFO_PDU | WANT_32BPP_SESSION */
+	/* SUPPORT_ERRINFO_PDU | WANT_32BPP_SESSION | VALID_CONNECTION_TYPE,
+	 * and SUPPORT_DYNVC_GFX_PROTOCOL for the graphics pipeline */
+	w_u16(&ud, 0x0001 | 0x0002 | (off("conntype") ? 0 : 0x0020) | (gfx_off() ? 0 : 0x0100));
 	w_zero(&ud, 64);
-	w_u8(&ud, 0);
+	w_u8(&ud, off("conntype") ? 0 : 6); /* connection type LAN */
 	w_u8(&ud, 0);
 	w_u32(&ud, selected_protocol);
 	/* CS_SECURITY */
@@ -319,12 +357,17 @@ static int mcs_connect(rdp *r)
 	w_u16(&ud, 12);
 	w_u32(&ud, 0);
 	w_u32(&ud, 0);
-	/* CS_NET: cliprdr */
+	/* CS_NET: cliprdr, drdynvc (dynamic channels: the graphics pipeline) */
 	w_u16(&ud, 0xc003);
-	w_u16(&ud, 8 + 12);
-	w_u32(&ud, 1);
+	int nchan = off("dvc") ? 1 : 2;
+	w_u16(&ud, 8 + nchan * 12);
+	w_u32(&ud, nchan);
 	w_bytes(&ud, "cliprdr\0", 8);
 	w_u32(&ud, 0xc0a00000); /* INITIALIZED | ENCRYPT_RDP | COMPRESS_RDP | SHOW_PROTOCOL */
+	if (nchan > 1) {
+		w_bytes(&ud, "drdynvc\0", 8);
+		w_u32(&ud, 0xc0800000); /* INITIALIZED | ENCRYPT_RDP | COMPRESS_RDP */
+	}
 
 	buf gcc;
 	b_init(&gcc, ud.len + 32);
@@ -425,6 +468,7 @@ static int mcs_attach(rdp *r)
 	static const uint8_t aurq[] = {MCS_AURQ << 2};
 	if (send_x224(r, erect, sizeof erect) || send_x224(r, aurq, sizeof aurq))
 		return -1;
+	dbg("erect domain, attach user sent");
 	buf b;
 	b_init(&b, 64);
 	int fp;
@@ -446,6 +490,7 @@ static int mcs_attach(rdp *r)
 				join[k] >> 8, join[k] & 0xff};
 		if (send_x224(r, d, 5))
 			return -1;
+		dbg("join channel %u", join[k]);
 		if (read_pdu(&r->c, &b, &fp) || parse_mcs(&b, &u, &c) != MCS_CJCF ||
 		    r_u8(&b) != 0) {
 			msg("join channel %u failed", join[k]);
@@ -499,7 +544,7 @@ static int send_client_info(rdp *r)
 	put_u16(&b, at, b.len - at - 2);
 	w_zero(&b, 172); /* time zone */
 	w_u32(&b, 0);    /* session id */
-	w_u32(&b, 0);    /* performance flags */
+	w_u32(&b, 0x0100 | 0x0080); /* desktop composition, font smoothing */
 	w_u16(&b, 0);    /* auto-reconnect cookie */
 	int rc = send_mcs(&r->c, 0, r->s.user, r->io, b.p, b.len);
 	memset(p.p, 0, p.len);
@@ -643,6 +688,18 @@ static void blit(const uint32_t *src, int sw, int l, int t, int cw, int ch)
 				x.fb[(size_t)dy * x.w + dx] = src[(size_t)y * sw + c] & 0xffffff;
 		}
 	}
+}
+
+static void gfx_paint(void *arg, int l, int t, int w, int h, const uint32_t *px, int stride)
+{
+	blit(px, stride, l, t, w, h);
+	dirty(l, t, l + w, t + h);
+}
+
+static void gfx_reset(void *arg, int w, int h)
+{
+	if (w != x.w || h != x.h)
+		x_window(w, h);
 }
 
 static void bitmap_update(buf *b)
@@ -845,9 +902,14 @@ static int slowpath(rdp *r, buf *b)
 		msg("server disconnected");
 		return -1;
 	}
-	if (t == MCS_SDIN && r->nchan && c == r->chan_id[0]) {
+	if (t == MCS_SDIN && r->nchan > CHAN_CLIPRDR && c == r->chan_id[CHAN_CLIPRDR]) {
 		if (r->clip && vc_recv(&r->cliprdr_acc, b))
 			return clip_recv(r->clip, &r->cliprdr_acc) < 0 ? -1 : 0;
+		return 0;
+	}
+	if (t == MCS_SDIN && r->nchan > CHAN_DRDYNVC && c == r->chan_id[CHAN_DRDYNVC]) {
+		if (r->gfx && vc_recv(&r->drdynvc_acc, b))
+			return gfxc_recv(r->gfx, &r->drdynvc_acc) < 0 ? -1 : 0;
 		return 0;
 	}
 	if (t != MCS_SDIN || c != r->io)
@@ -1167,6 +1229,11 @@ int main(int argc, char **argv)
 	}
 	if (mcs_connect(&r) || mcs_attach(&r) || send_client_info(&r))
 		return 1;
+	b_init(&r.drdynvc_acc, 4096);
+	if (r.nchan > CHAN_DRDYNVC && !gfx_off()) {
+		gfxc_ops ops = {&r, dvc_send, gfx_paint, gfx_reset};
+		r.gfx = gfxc_new(&ops);
+	}
 
 	buf b;
 	b_init(&b, 65536);
