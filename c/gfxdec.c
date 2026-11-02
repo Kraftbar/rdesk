@@ -11,8 +11,10 @@
  * bands of vertical bars (cached), and subcodec rects (raw, NSCodec,
  * RLEX), applied in that order; whole bitmaps can be cached as glyphs. */
 #include "gfxdec.h"
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static inline uint8_t clamp8(int v)
 {
@@ -65,30 +67,74 @@ static size_t left(const rd *r)
 	return r->err ? 0 : r->n - r->pos;
 }
 
-/* bits, most significant first; zeros past the end */
+/* bits, most significant first; zeros past the end. acc holds the next
+ * cnt bits at its top. */
 typedef struct {
 	const uint8_t *p;
-	size_t n, pos, end;
+	size_t n, i;     /* bytes; the next one to load */
+	size_t pos, end; /* bits taken; all there are */
+	uint64_t acc;
+	int cnt;
 } bits;
 
 static void bits_init(bits *b, const uint8_t *p, size_t n)
 {
-	b->p = p;
-	b->n = n;
-	b->pos = 0;
-	b->end = n * 8;
+	*b = (bits){p, n, 0, 0, n * 8, 0, 0};
 }
 
-static uint32_t get(bits *b, int k) /* k <= 24 */
+static inline void refill(bits *b)
+{
+	while (b->cnt <= 56) {
+		uint64_t byte = b->i < b->n ? b->p[b->i] : 0;
+		b->i++;
+		b->acc |= byte << (56 - b->cnt);
+		b->cnt += 8;
+	}
+}
+
+static inline void skip(bits *b, int k)
+{
+	b->acc = k < 64 ? b->acc << k : 0;
+	b->cnt -= k;
+	b->pos += k;
+}
+
+static inline uint32_t get(bits *b, int k) /* k <= 32 */
 {
 	if (!k)
 		return 0;
-	size_t i = b->pos >> 3;
-	uint32_t w = 0;
-	for (int j = 0; j < 4; j++)
-		w = w << 8 | (i + j < b->n ? b->p[i + j] : 0);
-	b->pos += k;
-	return (w << ((b->pos - k) & 7)) >> (32 - k);
+	if (b->cnt < k)
+		refill(b);
+	uint32_t v = b->acc >> (64 - k);
+	skip(b, k);
+	return v;
+}
+
+/* 1 bits up to a 0 (taken too) or the end: how many */
+static inline uint32_t ones(bits *b)
+{
+	uint32_t n = 0;
+	for (;;) {
+		if (b->pos >= b->end)
+			return n;
+		if (b->cnt < 8)
+			refill(b);
+		uint64_t inv = ~b->acc;
+		int lead = inv ? __builtin_clzll(inv) : 64;
+		if (lead > b->cnt)
+			lead = b->cnt;
+		size_t rest = b->end - b->pos;
+		if ((size_t)lead >= rest) {
+			skip(b, rest);
+			return n + rest;
+		}
+		skip(b, lead);
+		n += lead;
+		if (b->cnt) { /* a 0 ends them */
+			skip(b, 1);
+			return n;
+		}
+	}
 }
 
 /* ---- RLGR1 ----------------------------------------------------------- */
@@ -108,9 +154,7 @@ static int clampk(int v)
 static uint32_t gr(bits *b, int *krp)
 {
 	int kr = *krp >> LSGR;
-	uint32_t vk = 0;
-	while (b->pos < b->end && get(b, 1))
-		vk++;
+	uint32_t vk = ones(b);
 	uint32_t mag = vk << kr | get(b, kr);
 	if (!vk)
 		*krp = clampk(*krp - 2);
@@ -240,9 +284,9 @@ static void idwt_plain(int16_t *d, int16_t *tmp, int sw)
 	}
 }
 
-/* Reduce extrapolate: lows and highs to nl + nh outputs, along a line
- * (steps for the next value of each), for count lines (lstride etc.
- * apart). */
+/* Reduce extrapolate, as FreeRDP's: lows and highs to nl + nh outputs
+ * along each of count lines, values steps apart (ls, hs, xs) and lines
+ * lstep etc. apart. */
 static void idwt_line(const int16_t *L, int ls, const int16_t *H, int hs, int16_t *X, int xs,
 		      int nl, int nh, int count, int lstep, int hstep, int xstep)
 {
@@ -289,6 +333,48 @@ static void idwt_line(const int16_t *L, int ls, const int16_t *H, int hs, int16_
 	}
 }
 
+/* idwt_line down every column at once: lows L (nl rows) and highs H (nh
+ * rows), all n wide, to nl + nh rows of X. The columns don't depend on
+ * each other, so the inner loops run along rows and vectorize. */
+static void idwt_cols(const int16_t *L, const int16_t *H, int16_t *X, int nl, int nh, int n)
+{
+	int16_t x0[64], h0[64];
+	for (int c = 0; c < n; c++) {
+		h0[c] = H[c];
+		x0[c] = L[c] - H[c];
+	}
+	for (int j = 0; j < nh - 1; j++) {
+		const int16_t *h1 = H + (j + 1) * n, *l = L + (j + 1) * n;
+		int16_t *o = X + 2 * j * n;
+		for (int c = 0; c < n; c++) {
+			int16_t x2 = l[c] - (h0[c] + h1[c]) / 2;
+			o[c] = x0[c];
+			o[n + c] = (x0[c] + x2) / 2 + 2 * h0[c];
+			x0[c] = x2;
+			h0[c] = h1[c];
+		}
+	}
+	int16_t *o = X + 2 * (nh - 1) * n;
+	const int16_t *l = L + nh * n;
+	for (int c = 0; c < n; c++) { /* x0 is the last x2 */
+		if (nl <= nh) {
+			o[c] = x0[c];
+			o[n + c] = x0[c] + 2 * h0[c];
+		} else if (nl == nh + 1) {
+			int16_t x = l[c] - h0[c];
+			o[c] = x0[c];
+			o[n + c] = (x + x0[c]) / 2 + 2 * h0[c];
+			o[2 * n + c] = x;
+		} else {
+			int16_t x = l[c] - h0[c] / 2;
+			o[c] = x0[c];
+			o[n + c] = (x + x0[c]) / 2 + 2 * h0[c];
+			o[2 * n + c] = x;
+			o[3 * n + c] = (x + l[n + c]) / 2;
+		}
+	}
+}
+
 static void idwt_extrapolate(int16_t *d, int16_t *tmp, int level)
 {
 	int nl = (64 >> level) + 1, nh = level == 1 ? 31 : (64 + (1 << (level - 1))) >> level;
@@ -297,7 +383,7 @@ static void idwt_extrapolate(int16_t *d, int16_t *tmp, int level)
 	int16_t *L = tmp, *H = tmp + nl * w;
 	idwt_line(ll, 1, hl, 1, L, 1, nl, nh, nl, nl, nh, w); /* LL + HL -> L */
 	idwt_line(lh, 1, hh, 1, H, 1, nl, nh, nh, nl, nh, w); /* LH + HH -> H */
-	idwt_line(L, w, H, w, d, w, nl, nh, w, 1, 1, 1);      /* L + H, down columns */
+	idwt_cols(L, H, d, nl, nh, w);                        /* L + H, down the columns */
 }
 
 static void idwt(int16_t *d, int extrapolate)
@@ -314,9 +400,20 @@ static void idwt(int16_t *d, int extrapolate)
 	}
 }
 
-/* Y, Cb, Cr (11.5 fixed point, Y less 4096) of a tile onto px where the
- * region's rects cover it. */
-static void put_tile(prog *p, uint32_t *px, int16_t *c[3], int tx, int ty, const uint16_t *rects, int nr,
+/* Y, Cb, Cr of a tile (11.5 fixed point, Y less 4096) to BGRX. */
+static void to_rgb(int16_t *c[3], uint32_t *rgb)
+{
+	for (int k = 0; k < 4096; k++) {
+		int64_t Y = (int64_t)(c[0][k] + 4096) << 16;
+		int cb = c[1][k], cr = c[2][k];
+		rgb[k] = clamp8((int16_t)((Y + cr * 91916LL) >> 16) >> 5) << 16 |
+			 clamp8((int16_t)((Y - cb * 22527LL - cr * 46819LL) >> 16) >> 5) << 8 |
+			 clamp8((int16_t)((Y + cb * 115992LL) >> 16) >> 5);
+	}
+}
+
+/* A decoded tile onto px where the region's rects cover it. */
+static void put_tile(prog *p, uint32_t *px, const uint32_t *rgb, int tx, int ty, const uint16_t *rects, int nr,
 		     void (*done)(void *, int, int, int, int), void *arg)
 {
 	int x0 = tx * 64, y0 = ty * 64;
@@ -329,14 +426,7 @@ static void put_tile(prog *p, uint32_t *px, int16_t *c[3], int tx, int ty, const
 		if (rr <= l || b <= t)
 			continue;
 		for (int y = t; y < b; y++)
-			for (int x = l; x < rr; x++) {
-				int k = (y - y0) * 64 + (x - x0);
-				int64_t Y = (int64_t)(c[0][k] + 4096) << 16;
-				int cb = c[1][k], cr = c[2][k];
-				px[(size_t)y * p->w + x] = clamp8((int16_t)((Y + cr * 91916LL) >> 16) >> 5) << 16 |
-							   clamp8((int16_t)((Y - cb * 22527LL - cr * 46819LL) >> 16) >> 5) << 8 |
-							   clamp8((int16_t)((Y + cb * 115992LL) >> 16) >> 5);
-			}
+			memcpy(px + (size_t)y * p->w + l, rgb + (y - y0) * 64 + (l - x0), (size_t)(rr - l) * 4);
 		done(arg, l, t, rr - l, b - t);
 	}
 }
@@ -415,8 +505,9 @@ static void upgrade_band(upgrade *u, int16_t *cur, int16_t *sign, int n, int shi
 	}
 }
 
-static int prog_tile(prog *p, const region *rg, int type, rd *r, uint32_t *px,
-		     void (*done)(void *, int, int, int, int), void *arg)
+/* A tile's next pass, onto its coefficients, and its pixels into rgb.
+ * Touches only its own tile's state: tiles go to threads. */
+static int prog_tile(prog *p, const region *rg, int type, rd *r, uint32_t *rgb, int *txp, int *typ)
 {
 	int qi[3] = {u8(r), u8(r), u8(r)};
 	int tx = u16(r), ty = u16(r);
@@ -479,13 +570,79 @@ static int prog_tile(prog *p, const region *rg, int type, rd *r, uint32_t *px,
 		memcpy(t->bitpos[k], pos, 10);
 		idwt(out[k], ex);
 	}
-	put_tile(p, px, c, tx, ty, rg->rects, rg->nrects, done, arg);
+	to_rgb(c, rgb);
+	*txp = tx;
+	*typ = ty;
 	return 0;
+}
+
+typedef struct {
+	int type;
+	rd body;
+	int tx, ty, bad;
+} tjob;
+
+typedef struct {
+	prog *p;
+	const region *rg;
+	tjob *jobs;
+	uint32_t (*rgb)[4096];
+	int from, to;
+} trun;
+
+static void *run_tiles(void *arg)
+{
+	trun *t = arg;
+	for (int i = t->from; i < t->to; i++) {
+		tjob *j = &t->jobs[i];
+		j->bad = prog_tile(t->p, t->rg, j->type, &j->body, t->rgb[i], &j->tx, &j->ty);
+	}
+	return NULL;
+}
+
+/* Decode the tiles: a whole-screen change is hundreds at a fifth of a
+ * millisecond each, so they go to every core in contiguous runs (the
+ * server's encoder does the same), unless a tile comes twice. */
+static void decode_tiles(prog *p, const region *rg, tjob *jobs, int n, uint32_t (*rgb)[4096])
+{
+	enum { MAXRUNS = 8, MINRUN = 8 };
+	static int cores;
+	if (!cores) {
+		cores = sysconf(_SC_NPROCESSORS_ONLN);
+		cores = cores < 1 ? 1 : cores > MAXRUNS ? MAXRUNS : cores;
+	}
+	int runs = n / MINRUN < cores ? n / MINRUN : cores;
+	if (runs > 1) {
+		uint8_t *seen = calloc((size_t)p->tw * p->th, 1);
+		for (int i = 0; i < n && runs > 1; i++) {
+			const uint8_t *b = jobs[i].body.p;
+			int tx = jobs[i].body.n >= 7 ? b[3] | b[4] << 8 : -1, ty = jobs[i].body.n >= 7 ? b[5] | b[6] << 8 : -1;
+			if (tx < 0 || tx >= p->tw || ty >= p->th || seen[ty * p->tw + tx]++)
+				runs = 1;
+		}
+		free(seen);
+	}
+	trun r[MAXRUNS];
+	pthread_t th[MAXRUNS];
+	int started[MAXRUNS] = {0};
+	if (runs < 1)
+		runs = 1;
+	for (int k = 0; k < runs; k++)
+		r[k] = (trun){p, rg, jobs, rgb, n * k / runs, n * (k + 1) / runs};
+	/* this thread takes the first run, and any a thread couldn't */
+	for (int k = 1; k < runs; k++)
+		started[k] = !pthread_create(&th[k], NULL, run_tiles, &r[k]);
+	for (int k = 0; k < runs; k++)
+		if (!started[k])
+			run_tiles(&r[k]);
+	for (int k = 1; k < runs; k++)
+		if (started[k])
+			pthread_join(th[k], NULL);
 }
 
 static int prog_region(prog *p, rd *r, uint32_t *px, void (*done)(void *, int, int, int, int), void *arg)
 {
-	static region rg; /* big; decoding is single-threaded */
+	static region rg; /* big; one region at a time */
 	if (u8(r) != 64)
 		return -1;
 	rg.nrects = u16(r);
@@ -511,8 +668,9 @@ static int prog_region(prog *p, rd *r, uint32_t *px, void (*done)(void *, int, i
 		for (int k = 0; k < 3; k++)
 			unpack_quant(pv + 16 * i + 1 + 5 * k, rg.progq[i][k]);
 	rd t = {tiles, tsize, 0, 0};
-	int bad = 0;
-	for (int i = 0; i < ntiles && left(&t) >= 6 && !bad; i++) {
+	int bad = 0, n = 0;
+	tjob *jobs = malloc((size_t)(ntiles + 1) * sizeof *jobs);
+	for (int i = 0; i < ntiles && left(&t) >= 6; i++) {
 		size_t start = t.pos;
 		int type = u16(&t);
 		uint32_t len = u32(&t);
@@ -520,11 +678,20 @@ static int prog_region(prog *p, rd *r, uint32_t *px, void (*done)(void *, int, i
 			bad = 1;
 			break;
 		}
-		rd b = {tiles + start + 6, len - 6, 0, 0};
 		if (type >= 0xccc5 && type <= 0xccc7)
-			bad = prog_tile(p, &rg, type, &b, px, done, arg);
+			jobs[n++] = (tjob){type, {tiles + start + 6, len - 6, 0, 0}, 0, 0, 0};
 		t.pos = start + len;
 	}
+	uint32_t(*rgb)[4096] = malloc((size_t)(n + 1) * sizeof *rgb);
+	decode_tiles(p, &rg, jobs, n, rgb);
+	for (int i = 0; i < n; i++) {
+		if (jobs[i].bad)
+			bad = 1;
+		else
+			put_tile(p, px, rgb[i], jobs[i].tx, jobs[i].ty, rg.rects, rg.nrects, done, arg);
+	}
+	free(rgb);
+	free(jobs);
 	free(rc);
 	return bad ? -1 : 0;
 }
