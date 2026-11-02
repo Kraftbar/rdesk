@@ -1,3 +1,5 @@
-/target
-/rdesk-win.zip
-__pycache__/
+*.o
+rdesk-rdpc
+rdesk-rdpc-client
+*.ppm
+gfxreplay

@@ -1,104 +1,56 @@
 rdesk
 =====
 
-RDP server for a live X11 desktop. H.264 (NVENC) to mstsc, 1:1 window
-for phones. Built on IronRDP. See WORKNOTES.md.
+RDP server for a live X11 desktop, and an RDP client for X11, in C with
+no RDP libraries. (The earlier Rust version, rdesk-rdp on IronRDP, with
+the cold-boot LightDM login, is in the history before this layout.)
 
-    rdp.rs      rdesk-rdp, the server
-    x11cap.rs   capture, cursor, ffmpeg
-    server.rs   rdesk-server, older custom protocol
-    client.rs   client for rdesk-server
-    proto.rs    its wire format
+    rdp.c rdp.h       wire format: buffers, TPKT/fast-path, BER/PER, MCS, channels
+    nla.c             CredSSP v2-6, NTLMv2 (MIC, key exchange), SPNEGO, MD4/RC4
+    planar.c          RDP 6.0 planar codec
+    clip.c            text clipboard, cliprdr <-> X11 CLIPBOARD, either side
+    server.c          rdesk-rdpc, the server
+    gfx.c, rfx.c      its graphics pipeline: H.264 (x264), RemoteFX (Progressive)
+    client.c          rdesk-rdpc-client, the client
+    gfxc.c, gfxdec.c  its graphics pipeline: H.264 (libavcodec), Progressive,
+                      ClearCodec; display control (resizing)
+    gfxreplay.c       decodes a recorded graphics session without a server
 
-Build
------
+Build: `make` (and `make gfxreplay`). Needs libssl, Xlib, Xext, Xfixes,
+Xdamage, Xrandr, Xcursor, libXtst.so.6, libx264, libavcodec.
 
-    cargo build --release
+Server
+------
 
-Needs ffmpeg, openssl, DISPLAY. NVENC, or --cpu for libx264.
+    rdesk-rdpc [--bind ADDR:PORT] [--fps N] [--pass PW] [--certdir DIR]
+               [--no-nla] [--set-password] [-v|-vv]
 
-Usage
------
+Needs DISPLAY (and XAUTHORITY when started outside the desktop). Default
+port 3390, certdir ~/.config/rdesk (cert.pem, key.pem, nthash). NLA when
+the nthash file exists or with --pass; the password the client delegates
+is then checked with unix_chkpwd as well. Otherwise TLS, password from the
+client info. A successful Linux-password login stores the nthash, so NLA
+turns on by itself.
 
-    rdesk-rdp [options]
+Frames go as H.264 to clients that take it (mstsc), RemoteFX Progressive
+to those that don't (the iOS app), else planar bitmaps. A phone gets the
+real session reshaped to its size (xrandr, text scaling), put back when
+it leaves. RDESK_OFF=phone,gfx,avc,... switches parts off.
 
-    --bind ADDR:PORT    default 0.0.0.0:3390
-    --fps N             default 30
-    --bitrate RATE      default 12M
-    --cpu               libx264 instead of NVENC
-    --pass PASSWORD     NLA with this password
-    --pass-file FILE    same, from a file (default ~/.config/rdesk/password)
-    --set-password      store the NT hash of your Linux password, then exit
-    --viewport          1:1 window for every smaller client
-    --certdir DIR       default ~/.config/rdesk
-    --cold-boot         single LightDM login, desktop sized to the client
+Client
+------
 
-User is the Linux user running it. Login is the Linux password with NLA:
-mstsc prompts like it does for Windows, nothing saved. NLA needs the
-password's NT hash (~/.config/rdesk/nthash); install-cold-boot.sh adds an
-optional PAM hook that stores it whenever you type the password (login
-screen, unlock, sudo), so it also follows password changes; run as
-yourself, the installer's sudo prompt stores it. The server
-switches to NLA by itself once the file appears. Before that: TLS, mstsc
-must have the password saved (or run --set-password). With --pass: NLA with
-that fixed password.
+    rdesk-rdpc-client [-u USER] [-d DOMAIN] [-p PW] [-g WxH] [--no-nla]
+                      [--type TEXT] [--dump FILE.ppm [--dump-ms N]] HOST[:PORT]
 
-Client bugs
------------
+Password also from $RDP_PASSWORD, else prompted. With the graphics
+pipeline (Windows, rdesk-rdpc) the window is resizable and the desktop
+follows it. RDESK_OFF=gfx for bitmaps only; RDESK_GFX_RECORD=FILE saves
+the graphics for gfxreplay.
 
-iOS Windows app: Ctrl + "+" is never sent. Use Ctrl + "=" to zoom in
-(rdesk maps it), Ctrl + "-" to zoom out.
+Tested against
+--------------
 
-Service
--------
-
-    sudo cp rdesk-rdp.service /etc/systemd/system/
-    sudo systemctl enable --now rdesk-rdp
-
-Starts as root to read LightDM's X cookie, then drops to USER; serves the
-login screen after a reboot and the session that follows. Edit USER/HOME in
-the unit.
-
-Cold-boot experiment (this Mint/Cinnamon host)
---------------------------------------------
-
-    cargo build --release --bin rdesk-rdp
-    bash install-cold-boot.sh    # as yourself; sudo asks for your password
-
-Installs a LightDM wrapper around Slick Greeter, a protected local login socket,
-and an RDP service override with --cold-boot. It restarts only RDP; the wrapper
-takes effect on the next boot. A copy of the previously running server is kept
-for rollback. The supplied configuration selects nybo on seat0.
-
-Test from a LAN laptop: reboot the host, leave it at the login screen, and use
-mstsc at 1920x1080 and the **Linux** password (see above). LightDM authenticates those credentials with PAM and
-starts Cinnamon; RDP waits for the desktop, switches the monitor to the client's
-size if it has that mode (else the largest mode that fits; phones keep the
-monitor's own mode), and begins streaming. The physical monitor changes too. No password is saved by
-the bridge. Normal local login remains available through Slick Greeter.
-
-Existing Cinnamon sessions keep their resolution. This first version supports
-one unrotated monitor, the normal password PAM
-conversation, and the system password (TLS or nthash NLA). NLA password files and additional PAM
-prompts (OTP/password changes) are not supported by --cold-boot. A locked existing
-session is outside this boot-login experiment. The selected display mode is not
-automatically restored on disconnect.
-
-The server follows X screen-size changes without reconnecting, keeping the RDP
-surface fixed and rebuilding capture/encoding as needed. This does not implement
-client Display Control/window-resize negotiation.
-
-    journalctl -u rdesk-rdp -b --no-pager
-    sudo bash install-cold-boot.sh --rollback
-
-Rollback restarts the saved RDP binary and restores the stock greeter at the next
-boot; it does not interrupt the current local desktop.
-
-Checks: `python3 -B -m unittest -v test_greeter_bridge` exercises local/remote
-authentication routing, failure recovery and the installed liblightdm against a
-simulated daemon. `cargo test --bin rdesk-rdp` checks sizing and input mapping.
-The ignored `live_capture_tracks_resize` test requires a disposable Xephyr server
-specified by RDESK_TEST_DISPLAY. A real cold boot + mstsc remains the acceptance
-test; these component checks do not establish end-to-end login success. The user
-confirmed successful LAN remote login on 2026-09-17, followed by a remote
-disconnect and local logout/login that restored the normal display setup.
+Server: mstsc, the iOS Windows App, xfreerdp3, the client.
+Client: Windows 11 (NLA, ClearCodec, Progressive, H.264, resizing,
+clipboard), the server.
