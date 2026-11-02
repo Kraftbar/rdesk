@@ -69,8 +69,15 @@ typedef struct {
 	int mapped, ox, oy;
 	AVCodecContext *avc; /* each surface its own H.264 stream */
 	AVFrame *frame;
-	prog *prog; /* and its Progressive tiles */
 } surface;
+
+/* Progressive tiles, kept per surface whatever the codec context */
+#define MAX_CONTEXTS 32
+typedef struct {
+	int used;
+	uint16_t surface;
+	prog *prog;
+} context;
 
 typedef struct {
 	int w, h;
@@ -92,6 +99,8 @@ struct gfxc {
 	int noted[16]; /* codecs said to be skipped */
 	AVPacket *pkt;
 	clear *clear;
+	context ctx[MAX_CONTEXTS];
+	FILE *rec; /* RDESK_GFX_RECORD */
 	uint32_t *tmp;
 	size_t tmpn;
 };
@@ -105,6 +114,9 @@ gfxc *gfxc_new(const gfxc_ops *ops)
 	g->hist = malloc(HISTORY);
 	g->pkt = av_packet_alloc();
 	g->clear = clear_new();
+	const char *rec = getenv("RDESK_GFX_RECORD");
+	if (rec && !(g->rec = fopen(rec, "wb")))
+		perror(rec);
 	return g;
 }
 
@@ -112,7 +124,6 @@ static void surface_free(surface *s)
 {
 	if (!s)
 		return;
-	prog_free(s->prog);
 	avcodec_free_context(&s->avc);
 	av_frame_free(&s->frame);
 	free(s->px);
@@ -129,6 +140,10 @@ void gfxc_free(gfxc *g)
 		free(g->cache[i].px);
 	av_packet_free(&g->pkt);
 	clear_free(g->clear);
+	if (g->rec)
+		fclose(g->rec);
+	for (int i = 0; i < MAX_CONTEXTS; i++)
+		prog_free(g->ctx[i].prog);
 	b_free(&g->in);
 	b_free(&g->out);
 	free(g->hist);
@@ -368,6 +383,8 @@ static void avc420(gfxc *g, surface *s, const uint8_t *p, size_t n)
 			dbg("gfx: H.264 picture format %d", f->format);
 			continue;
 		}
+		dbg("gfx: H.264 picture %dx%d, %u rects, first %u,%u-%u,%u", f->width, f->height, nr,
+		    rects[0] | rects[1] << 8, rects[2] | rects[3] << 8, rects[4] | rects[5] << 8, rects[6] | rects[7] << 8);
 		yuv_rects(g, s, f, rects, nr);
 	}
 }
@@ -402,28 +419,63 @@ typedef struct {
 static void prog_done(void *arg, int x, int y, int w, int h)
 {
 	shown *a = arg;
+	if (verbose > 1)
+		dbg("gfx: progressive at %d,%d %dx%d", x, y, w, h);
 	show(a->g, a->s, x, y, x + w, y + h);
+}
+
+/* A surface's Progressive slot; NULL when there is no room. */
+static context *find_context(gfxc *g, uint16_t sid)
+{
+	context *free_slot = NULL;
+	for (int i = 0; i < MAX_CONTEXTS; i++) {
+		context *c = &g->ctx[i];
+		if (c->used && c->surface == sid)
+			return c;
+		if (!c->used && !free_slot)
+			free_slot = c;
+	}
+	if (free_slot)
+		*free_slot = (context){1, sid, NULL};
+	return free_slot;
+}
+
+/* the surface is gone, or new */
+static void drop_contexts(gfxc *g, uint16_t sid)
+{
+	for (int i = 0; i < MAX_CONTEXTS; i++) {
+		context *c = &g->ctx[i];
+		if (c->used && c->surface == sid) {
+			prog_free(c->prog);
+			*c = (context){0};
+		}
+	}
 }
 
 /* WIRE_TO_SURFACE_2: RemoteFX Progressive, onto the whole surface. */
 static void wire_to_surface_2(gfxc *g, buf *b)
 {
-	surface *s = get_surface(g, r_u16(b));
-	uint16_t codec = r_u16(b);
-	r_u32(b); /* codec context: one per surface, as Windows uses them */
+	uint16_t sid = r_u16(b), codec = r_u16(b);
+	r_u32(b); /* codec context */
 	r_u8(b);
 	uint32_t len = r_u32(b);
 	const uint8_t *p = r_bytes(b, len);
+	surface *s = get_surface(g, sid);
 	if (!s || !p)
 		return;
 	if (codec != CODEC_CAPROGRESSIVE) {
 		note_codec(g, codec);
 		return;
 	}
-	if (!s->prog)
-		s->prog = prog_new(s->w, s->h);
+	context *c = find_context(g, sid);
+	if (!c) {
+		msg("gfx: Progressive on more than %d surfaces", MAX_CONTEXTS);
+		return;
+	}
+	if (!c->prog)
+		c->prog = prog_new(s->w, s->h);
 	shown a = {g, s};
-	if (prog_decode(s->prog, p, len, s->px, prog_done, &a))
+	if (prog_decode(c->prog, p, len, s->px, prog_done, &a))
 		msg("gfx: bad Progressive message, %u bytes", len);
 }
 
@@ -438,6 +490,7 @@ static void wire_to_surface_1(gfxc *g, buf *b)
 	int w = r - l, h = bt - t;
 	if (!s || !p || w <= 0 || h <= 0)
 		return;
+	dbg("gfx: codec 0x%x at %d,%d %dx%d, %u bytes", codec, l, t, w, h, len);
 	switch (codec) {
 	case CODEC_UNCOMPRESSED:
 		if ((size_t)w * h * 4 <= len)
@@ -484,6 +537,7 @@ static int pdu(gfxc *g, uint16_t cmd, buf *b)
 		if (b->err || id >= MAX_SURFACES || !w || !h)
 			break;
 		surface_free(g->surf[id]);
+		drop_contexts(g, id);
 		surface *s = calloc(1, sizeof *s);
 		s->w = w;
 		s->h = h;
@@ -497,6 +551,7 @@ static int pdu(gfxc *g, uint16_t cmd, buf *b)
 		if (id < MAX_SURFACES) {
 			surface_free(g->surf[id]);
 			g->surf[id] = NULL;
+			drop_contexts(g, id);
 		}
 		break;
 	}
@@ -535,6 +590,7 @@ static int pdu(gfxc *g, uint16_t cmd, buf *b)
 			int l = r_u16(b), t = r_u16(b), r = r_u16(b), bt = r_u16(b);
 			if (!s || b->err || !clip(s, &l, &t, &r, &bt))
 				continue;
+			dbg("gfx: fill at %d,%d %dx%d with %06x", l, t, r - l, bt - t, px);
 			for (int y = t; y < bt; y++)
 				for (int x = l; x < r; x++)
 					s->px[(size_t)y * s->w + x] = px;
@@ -549,6 +605,7 @@ static int pdu(gfxc *g, uint16_t cmd, buf *b)
 		uint32_t *p = src && dst && !b->err ? copy_out(g, src, &l, &t, &r, &bt) : NULL;
 		for (int i = 0; i < n && p; i++) {
 			int x = r_u16(b), y = r_u16(b);
+			dbg("gfx: copy at %d,%d %dx%d from %d,%d", x, y, r - l, bt - t, l, t);
 			if (!b->err)
 				put(g, dst, x, y, (const uint8_t *)p, (size_t)(r - l) * 4, r - l, bt - t);
 		}
@@ -581,6 +638,7 @@ static int pdu(gfxc *g, uint16_t cmd, buf *b)
 		}
 		for (int i = 0; i < n && !b->err; i++) {
 			int x = r_u16(b), y = r_u16(b);
+			dbg("gfx: cached at %d,%d %dx%d from slot %u", x, y, c->w, c->h, slot);
 			if (!b->err)
 				put(g, s, x, y, (const uint8_t *)c->px, (size_t)c->w * 4, c->w, c->h);
 		}
@@ -594,14 +652,10 @@ static int pdu(gfxc *g, uint16_t cmd, buf *b)
 		}
 		break;
 	}
-	case DELETE_ENCODING_CONTEXT: {
-		surface *s = get_surface(g, r_u16(b));
-		if (s) {
-			prog_free(s->prog);
-			s->prog = NULL;
-		}
+	case DELETE_ENCODING_CONTEXT:
+		/* Windows deletes a context after each image, then upgrades
+		 * its tiles in the next one: the tiles stay (as FreeRDP's) */
 		break;
-	}
 	case CACHE_IMPORT_REPLY:
 	case MAP_SURFACE_TO_WINDOW:
 		break;
@@ -784,8 +838,20 @@ static int segmented(gfxc *g, const uint8_t *p, size_t n)
 		msg("gfx: cannot decompress a message (descriptor 0x%02x)", d);
 		return -1;
 	}
+	if (g->rec) {
+		uint32_t len = g->out.len;
+		fwrite(&len, 4, 1, g->rec);
+		fwrite(g->out.p, 1, len, g->rec);
+		fflush(g->rec);
+	}
 	g->out.pos = 0;
 	return pdus(g, &g->out);
+}
+
+int gfxc_replay(gfxc *g, const uint8_t *p, size_t n)
+{
+	buf b = {.p = (uint8_t *)p, .len = n};
+	return pdus(g, &b);
 }
 
 /* ---- dynamic channels ------------------------------------------------- */

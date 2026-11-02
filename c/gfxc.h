@@ -19,3 +19,8 @@ gfxc *gfxc_new(const gfxc_ops *ops);
 void gfxc_free(gfxc *g);
 /* One whole drdynvc channel PDU. Returns -1 to drop the connection. */
 int gfxc_recv(gfxc *g, buf *b);
+
+/* RDESK_GFX_RECORD=FILE saves the server's PDUs, decompressed, each with
+ * its length (32 bits) first; gfxc_replay() takes them back, one at a
+ * time (gfxreplay.c). */
+int gfxc_replay(gfxc *g, const uint8_t *p, size_t n);

@@ -12,5 +12,8 @@ rdesk-rdpc-client: client.o rdp.o nla.o planar.o clip.o gfxc.o gfxdec.o
 %.o: %.c rdp.h nla.h planar.h clip.h gfx.h gfxc.h gfxdec.h rfx.h
 	$(CC) $(CFLAGS) -c $<
 
+gfxreplay: gfxreplay.o gfxc.o gfxdec.o rdp.o planar.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS_SSL) -lavcodec -lavutil
+
 clean:
-	rm -f *.o rdesk-rdpc rdesk-rdpc-client
+	rm -f *.o rdesk-rdpc rdesk-rdpc-client gfxreplay
