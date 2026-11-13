@@ -44,6 +44,7 @@
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -152,7 +153,7 @@ static void wins_init(void)
 {
 	XWindowAttributes wa;
 	XGetWindowAttributes(x.dpy, x.root, &wa);
-	XSelectInput(x.dpy, x.root, wa.your_event_mask | SubstructureNotifyMask);
+	XSelectInput(x.dpy, x.root, wa.your_event_mask | SubstructureNotifyMask | StructureNotifyMask);
 	Window r, p, *kids;
 	unsigned n;
 	nwins = 0;
@@ -166,6 +167,8 @@ static void wins_init(void)
 	}
 	XFree(kids);
 }
+
+static int x_resized; /* the screen changed size: rotated, xrandr */
 
 /* Root's children come and go, move and resize. */
 static void win_event(XEvent *ev)
@@ -181,7 +184,9 @@ static void win_event(XEvent *ev)
 		break;
 	case ConfigureNotify: {
 		XConfigureEvent *e = &ev->xconfigure;
-		if (e->event == x.root)
+		if (e->window == x.root)
+			x_resized |= e->width != x.w || e->height != x.h;
+		else if (e->event == x.root)
 			win_set(e->window, e->x, e->y, e->width, e->height, e->border_width);
 		break;
 	}
@@ -539,6 +544,62 @@ static SSL_CTX *tls_ctx(void)
 }
 
 /* ---- login ---------------------------------------------------------- */
+
+/* At the login screen rdesk-greeter (greeter.c) listens here: the
+ * client's password starts the session, as Windows does it; with a
+ * session already running, it unlocks it. */
+#define GREETER_SOCK "/run/rdesk-login/greeter.sock"
+
+static void put_be32(uint8_t *p, uint32_t v)
+{
+	p[0] = v >> 24;
+	p[1] = v >> 16;
+	p[2] = v >> 8;
+	p[3] = v;
+}
+
+static void session_login(const char *pass)
+{
+	struct sockaddr_un sa = {.sun_family = AF_UNIX};
+	snprintf(sa.sun_path, sizeof sa.sun_path, "%s", GREETER_SOCK);
+	struct passwd *pw = getpwuid(getuid());
+	if (opt.pass || !pw)
+		return; /* a test password: not the user's */
+	/* the socket outlives the greeter (LightDM kills it): try it */
+	int s = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+	if (s < 0 || connect(s, (struct sockaddr *)&sa, sizeof sa)) {
+		if (s >= 0)
+			close(s);
+		/* no login screen: a session, maybe locked; the login opens it */
+		char cmd[200];
+		snprintf(cmd, sizeof cmd,
+			 "s=$(loginctl show-user --value -p Display %d 2>/dev/null) && [ -n \"$s\" ] && "
+			 "loginctl unlock-session \"$s\"", (int)getuid());
+		if (system(cmd) == 0)
+			msg("session unlocked");
+		return;
+	}
+	size_t ul = strlen(pw->pw_name), pl = strlen(pass);
+	uint8_t req[8 + 256 + 512];
+	if (ul > 256 || pl > 512) {
+		close(s);
+		return;
+	}
+	put_be32(req, ul);
+	memcpy(req + 4, pw->pw_name, ul);
+	put_be32(req + 4 + ul, pl);
+	memcpy(req + 8 + ul, pass, pl);
+	struct timeval tv = {25, 0};
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+	uint8_t st = 3;
+	if (write(s, req, 8 + ul + pl) != (ssize_t)(8 + ul + pl) || read(s, &st, 1) != 1)
+		st = 3;
+	explicit_bzero(req, sizeof req);
+	close(s);
+	static const char *what[] = {"session starting", "password refused", "PAM wants more than a password",
+				     "greeter busy or timed out"};
+	msg("login screen: %s", what[st < 4 ? st : 3]);
+}
 
 static int check_password(const char *user, const char *pass)
 {
@@ -1084,6 +1145,8 @@ static int mcs_domain(client *cl, buf *b)
 			msg("client info: user '%s' domain '%s' flags 0x%x password %s", cl->username,
 			    dom, iflags, cbp ? "given" : "empty");
 			int ok = !b->err && (cl->nla_ok || check_password(cl->username, pass));
+			if (ok && !cl->nla_ok)
+				session_login(pass);
 			memset(pass, 0, sizeof pass);
 			if (!ok) {
 				msg("login failed");
@@ -1864,13 +1927,15 @@ static double phys_diag(const client *cl)
 	return cl->physw && cl->physh ? hypot(cl->physw, cl->physh) : 0;
 }
 
-/* A display under 26 cm (10") across, or a desktop under half the screen. */
+/* A display under 20 cm (8") across, or a portrait desktop. Not by size
+ * against the screen: next to an ultrawide a laptop's 1280x800 is under
+ * half of it, and took the screen. */
 static int phone_wanted(const client *cl)
 {
 	if (off("phone") || !cl->cw || !cl->ch)
 		return 0;
 	double d = phys_diag(cl);
-	return (d && d < 260) || 2.0 * cl->cw * cl->ch < (double)main_w * main_h;
+	return (d && d < 200) || cl->ch > cl->cw;
 }
 
 /* Text a bit smaller than the phone's own: at its full density (~400 dpi)
@@ -2193,6 +2258,8 @@ static void serve(int fd, SSL_CTX *ctx)
 			goto done;
 		}
 		int ok = check_password(cr.user, cr.pass);
+		if (ok)
+			session_login(cr.pass);
 		memset(cr.pass, 0, sizeof cr.pass);
 		if (!ok) {
 			msg("NLA: delegated password rejected (stale NT hash?)");
@@ -2232,6 +2299,18 @@ static void serve(int fd, SSL_CTX *ctx)
 				x.damaged = 1;
 			else
 				win_event(&ev);
+		}
+		if (x_resized) {
+			/* the client keeps its desktop; the screen is scaled
+			 * into it anew (tab's login screen is portrait, the
+			 * session turns it) */
+			x_resized = 0;
+			if (x_alloc_image())
+				break;
+			msg("screen now %dx%d", x.w, x.h);
+			if (active)
+				view_setup(&cl);
+			cl.full = 1;
 		}
 		int64_t t = now_ms();
 		if (active && t >= next && !busy) {
@@ -2392,8 +2471,12 @@ int main(int argc, char **argv)
 		snprintf(addr, sizeof addr, "unix:path=%s", bus);
 		setenv("DBUS_SESSION_BUS_ADDRESS", addr, 1);
 	}
-	if (x_open(NULL))
-		return 1;
+	/* at boot, X lets us in once rdesk-greeter is up */
+	for (int i = 0; x_open(NULL); i++) {
+		if (i == 0)
+			msg("waiting for the display");
+		sleep(2);
+	}
 	screen_back(); /* left phone-shaped by a crash */
 	SSL_CTX *ctx = tls_ctx();
 	if (!ctx)

@@ -15,6 +15,8 @@ the cold-boot LightDM login, is in the history before this layout.)
     gfxc.c, gfxdec.c  its graphics pipeline: H.264 (libavcodec), Progressive,
                       ClearCodec; display control (resizing)
     gfxreplay.c       decodes a recorded graphics session without a server
+    greeter.c         rdesk-greeter: LightDM's greeter, wrapped, for RDP logins
+    install.sh        the service and the greeter, system-wide (sudo)
 
 Build: `make` (and `make gfxreplay`). Needs libssl, Xlib, Xext, Xfixes,
 Xdamage, Xrandr, Xcursor, libXtst.so.6, libx264, libavcodec.
@@ -36,6 +38,13 @@ Frames go as H.264 to clients that take it (mstsc), RemoteFX Progressive
 to those that don't (the iOS app), else planar bitmaps. A phone gets the
 real session reshaped to its size (xrandr, text scaling), put back when
 it leaves. RDESK_OFF=phone,gfx,avc,... switches parts off.
+
+From boot, as on Windows: `sudo ./install.sh` runs the server as a
+system service for you, and wraps Slick Greeter in rdesk-greeter. At the
+login screen an NLA login then starts your session, no login screen to
+type into; the connection stays up through it. The greeter lets you onto
+the login screen's X server (xhost localuser) so the server needs no
+root. `sudo ./install.sh --remove` undoes it.
 
 Client
 ------
